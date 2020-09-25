@@ -38,6 +38,7 @@ const (
 	ContentDisposition = "Content-Disposition"
 	Authorization      = "Authorization"
 	Action             = "Action"
+	Range              = "Range"
 )
 
 // Non standard S3 HTTP response constants
@@ -80,7 +81,7 @@ const (
 	AmzObjectLockRetainUntilDate  = "X-Amz-Object-Lock-Retain-Until-Date"
 	AmzObjectLockLegalHold        = "X-Amz-Object-Lock-Legal-Hold"
 	AmzObjectLockBypassGovernance = "X-Amz-Bypass-Governance-Retention"
-
+	AmzBucketReplicationStatus    = "X-Amz-Replication-Status"
 	// Multipart parts count
 	AmzMpPartsCount = "x-amz-mp-parts-count"
 
@@ -101,6 +102,9 @@ const (
 	AmzSecurityToken        = "X-Amz-Security-Token"
 	AmzDecodedContentLength = "X-Amz-Decoded-Content-Length"
 
+	AmzMetaUnencryptedContentLength = "X-Amz-Meta-X-Amz-Unencrypted-Content-Length"
+	AmzMetaUnencryptedContentMD5    = "X-Amz-Meta-X-Amz-Unencrypted-Content-Md5"
+
 	// Signature v2 related constants
 	AmzSignatureV2 = "Signature"
 	AmzAccessKeyID = "AWSAccessKeyId"
@@ -114,6 +118,21 @@ const (
 	// Server-Status
 	MinIOServerStatus = "x-minio-server-status"
 
-	// Delete special flag
+	// Delete special flag to force delete a bucket
 	MinIOForceDelete = "x-minio-force-delete"
+
+	// Header indicates if the mtime should be preserved by client
+	MinIOSourceMTime = "x-minio-source-mtime"
+
+	// Header indicates if the etag should be preserved by client
+	MinIOSourceETag = "x-minio-source-etag"
+)
+
+// Common http query params S3 API
+const (
+	VersionID = "versionId"
+
+	PartNumber = "partNumber"
+
+	UploadID = "uploadId"
 )

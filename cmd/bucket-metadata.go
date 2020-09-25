@@ -20,18 +20,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"path"
 	"time"
 
-	"github.com/minio/minio-go/v6/pkg/tags"
+	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/cmd/logger"
 	bucketsse "github.com/minio/minio/pkg/bucket/encryption"
 	"github.com/minio/minio/pkg/bucket/lifecycle"
 	objectlock "github.com/minio/minio/pkg/bucket/object/lock"
 	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/bucket/replication"
 	"github.com/minio/minio/pkg/bucket/versioning"
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/madmin"
@@ -59,17 +61,19 @@ var (
 // bucketMetadataFormat refers to the format.
 // bucketMetadataVersion can be used to track a rolling upgrade of a field.
 type BucketMetadata struct {
-	Name                  string
-	Created               time.Time
-	LockEnabled           bool // legacy not used anymore.
-	PolicyConfigJSON      []byte
-	NotificationConfigXML []byte
-	LifecycleConfigXML    []byte
-	ObjectLockConfigXML   []byte
-	VersioningConfigXML   []byte
-	EncryptionConfigXML   []byte
-	TaggingConfigXML      []byte
-	QuotaConfigJSON       []byte
+	Name                    string
+	Created                 time.Time
+	LockEnabled             bool // legacy not used anymore.
+	PolicyConfigJSON        []byte
+	NotificationConfigXML   []byte
+	LifecycleConfigXML      []byte
+	ObjectLockConfigXML     []byte
+	VersioningConfigXML     []byte
+	EncryptionConfigXML     []byte
+	TaggingConfigXML        []byte
+	QuotaConfigJSON         []byte
+	ReplicationConfigXML    []byte
+	BucketTargetsConfigJSON []byte
 
 	// Unexported fields. Must be updated atomically.
 	policyConfig       *policy.Policy
@@ -80,6 +84,8 @@ type BucketMetadata struct {
 	sseConfig          *bucketsse.BucketSSEConfig
 	taggingConfig      *tags.Tags
 	quotaConfig        *madmin.BucketQuota
+	replicationConfig  *replication.Config
+	bucketTargetConfig *madmin.BucketTargets
 }
 
 // newBucketMetadata creates BucketMetadata with the supplied name and Created to Now.
@@ -94,6 +100,7 @@ func newBucketMetadata(name string) BucketMetadata {
 		versioningConfig: &versioning.Versioning{
 			XMLNS: "http://s3.amazonaws.com/doc/2006-03-01/",
 		},
+		bucketTargetConfig: &madmin.BucketTargets{},
 	}
 }
 
@@ -119,7 +126,6 @@ func (b *BucketMetadata) Load(ctx context.Context, api ObjectLayer, name string)
 	default:
 		return fmt.Errorf("loadBucketMetadata: unknown version: %d", binary.LittleEndian.Uint16(data[2:4]))
 	}
-
 	// OK, parse data.
 	_, err = b.UnmarshalMsg(data[4:])
 	return err
@@ -136,7 +142,6 @@ func loadBucketMetadata(ctx context.Context, objectAPI ObjectLayer, bucket strin
 	if err != errConfigNotFound {
 		return b, err
 	}
-
 	// Old bucket without bucket metadata. Hence we migrate existing settings.
 	return b, b.convertLegacyConfigs(ctx, objectAPI)
 }
@@ -186,6 +191,10 @@ func (b *BucketMetadata) parseAllConfigs(ctx context.Context, objectAPI ObjectLa
 		b.taggingConfig = nil
 	}
 
+	if bytes.Equal(b.ObjectLockConfigXML, enabledBucketObjectLockConfig) {
+		b.VersioningConfigXML = enabledBucketVersioningConfig
+	}
+
 	if len(b.ObjectLockConfigXML) != 0 {
 		b.objectLockConfig, err = objectlock.ParseObjectLockConfig(bytes.NewReader(b.ObjectLockConfigXML))
 		if err != nil {
@@ -209,6 +218,22 @@ func (b *BucketMetadata) parseAllConfigs(ctx context.Context, objectAPI ObjectLa
 		}
 	}
 
+	if len(b.ReplicationConfigXML) != 0 {
+		b.replicationConfig, err = replication.ParseConfig(bytes.NewReader(b.ReplicationConfigXML))
+		if err != nil {
+			return err
+		}
+	} else {
+		b.replicationConfig = nil
+	}
+
+	if len(b.BucketTargetsConfigJSON) != 0 {
+		if err = json.Unmarshal(b.BucketTargetsConfigJSON, b.bucketTargetConfig); err != nil {
+			return err
+		}
+	} else {
+		b.bucketTargetConfig = &madmin.BucketTargets{}
+	}
 	return nil
 }
 
@@ -220,7 +245,9 @@ func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI Obj
 		bucketLifecycleConfig,
 		bucketQuotaConfigFile,
 		bucketSSEConfig,
-		bucketTaggingConfigFile,
+		bucketTaggingConfig,
+		bucketReplicationConfig,
+		bucketTargetsFile,
 		objectLockConfig,
 	}
 
@@ -238,6 +265,12 @@ func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI Obj
 
 		configData, err := readConfig(ctx, objectAPI, configFile)
 		if err != nil {
+			switch err.(type) {
+			case ObjectExistsAsDirectory:
+				// in FS mode it possible that we have actual
+				// files in this folder with `.minio.sys/buckets/bucket/configFile`
+				continue
+			}
 			if errors.Is(err, errConfigNotFound) {
 				// legacy file config not found, proceed to look for new metadata.
 				continue
@@ -270,13 +303,17 @@ func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI Obj
 			b.LifecycleConfigXML = configData
 		case bucketSSEConfig:
 			b.EncryptionConfigXML = configData
-		case bucketTaggingConfigFile:
+		case bucketTaggingConfig:
 			b.TaggingConfigXML = configData
 		case objectLockConfig:
 			b.ObjectLockConfigXML = configData
 			b.VersioningConfigXML = enabledBucketVersioningConfig
 		case bucketQuotaConfigFile:
 			b.QuotaConfigJSON = configData
+		case bucketReplicationConfig:
+			b.ReplicationConfigXML = configData
+		case bucketTargetsFile:
+			b.BucketTargetsConfigJSON = configData
 		}
 	}
 
@@ -311,17 +348,22 @@ func (b *BucketMetadata) Save(ctx context.Context, api ObjectLayer) error {
 	if err != nil {
 		return err
 	}
-
 	configFile := path.Join(bucketConfigPrefix, b.Name, bucketMetadataFile)
 	return saveConfig(ctx, api, configFile, data)
 }
 
 // deleteBucketMetadata deletes bucket metadata
 // If config does not exist no error is returned.
-func deleteBucketMetadata(ctx context.Context, obj ObjectLayer, bucket string) error {
-	configFile := path.Join(bucketConfigPrefix, bucket, bucketMetadataFile)
-	if err := deleteConfig(ctx, obj, configFile); err != nil && err != errConfigNotFound {
-		return err
+func deleteBucketMetadata(ctx context.Context, obj objectDeleter, bucket string) error {
+	metadataFiles := []string{
+		dataUsageCacheName,
+		bucketMetadataFile,
+	}
+	for _, metaFile := range metadataFiles {
+		configFile := path.Join(bucketConfigPrefix, bucket, metaFile)
+		if err := deleteConfig(ctx, obj, configFile); err != nil && err != errConfigNotFound {
+			return err
+		}
 	}
 	return nil
 }

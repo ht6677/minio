@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2015-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -77,6 +78,7 @@ var supportedHeaders = []string{
 	xhttp.AmzStorageClass,
 	xhttp.AmzObjectTagging,
 	"expires",
+	xhttp.AmzBucketReplicationStatus,
 	// Add more supported headers here.
 }
 
@@ -126,9 +128,35 @@ func extractMetadata(ctx context.Context, r *http.Request) (metadata map[string]
 	}
 
 	// Set content-type to default value if it is not set.
-	if _, ok := metadata["content-type"]; !ok {
-		metadata["content-type"] = "application/octet-stream"
+	if _, ok := metadata[strings.ToLower(xhttp.ContentType)]; !ok {
+		metadata[strings.ToLower(xhttp.ContentType)] = "application/octet-stream"
 	}
+
+	// https://github.com/google/security-research/security/advisories/GHSA-76wf-9vgp-pj7w
+	for k := range metadata {
+		if strings.EqualFold(k, xhttp.AmzMetaUnencryptedContentLength) || strings.EqualFold(k, xhttp.AmzMetaUnencryptedContentMD5) {
+			delete(metadata, k)
+		}
+	}
+
+	if contentEncoding, ok := metadata[strings.ToLower(xhttp.ContentEncoding)]; ok {
+		contentEncoding = trimAwsChunkedContentEncoding(contentEncoding)
+		if contentEncoding != "" {
+			// Make sure to trim and save the content-encoding
+			// parameter for a streaming signature which is set
+			// to a custom value for example: "aws-chunked,gzip".
+			metadata[strings.ToLower(xhttp.ContentEncoding)] = contentEncoding
+		} else {
+			// Trimmed content encoding is empty when the header
+			// value is set to "aws-chunked" only.
+
+			// Make sure to delete the content-encoding parameter
+			// for a streaming signature which is set to value
+			// for example: "aws-chunked"
+			delete(metadata, strings.ToLower(xhttp.ContentEncoding))
+		}
+	}
+
 	// Success.
 	return metadata, nil
 }
@@ -376,6 +404,9 @@ func getResource(path string, host string, domains []string) (string, error) {
 		}
 	}
 	for _, domain := range domains {
+		if host == minioReservedBucket+"."+domain {
+			continue
+		}
 		if !strings.HasSuffix(host, "."+domain) {
 			continue
 		}
@@ -393,6 +424,9 @@ func extractAPIVersion(r *http.Request) string {
 
 // If none of the http routes match respond with appropriate errors
 func errorResponseHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		return
+	}
 	version := extractAPIVersion(r)
 	switch {
 	case strings.HasPrefix(r.URL.Path, peerRESTPrefix):
@@ -401,7 +435,7 @@ func errorResponseHandler(w http.ResponseWriter, r *http.Request) {
 		writeErrorResponseString(r.Context(), w, APIError{
 			Code:           "XMinioPeerVersionMismatch",
 			Description:    desc,
-			HTTPStatusCode: http.StatusBadRequest,
+			HTTPStatusCode: http.StatusUpgradeRequired,
 		}, r.URL)
 	case strings.HasPrefix(r.URL.Path, storageRESTPrefix):
 		desc := fmt.Sprintf("Expected 'storage' API version '%s', instead found '%s', please upgrade the servers",
@@ -409,7 +443,7 @@ func errorResponseHandler(w http.ResponseWriter, r *http.Request) {
 		writeErrorResponseString(r.Context(), w, APIError{
 			Code:           "XMinioStorageVersionMismatch",
 			Description:    desc,
-			HTTPStatusCode: http.StatusBadRequest,
+			HTTPStatusCode: http.StatusUpgradeRequired,
 		}, r.URL)
 	case strings.HasPrefix(r.URL.Path, lockRESTPrefix):
 		desc := fmt.Sprintf("Expected 'lock' API version '%s', instead found '%s', please upgrade the servers",
@@ -417,7 +451,7 @@ func errorResponseHandler(w http.ResponseWriter, r *http.Request) {
 		writeErrorResponseString(r.Context(), w, APIError{
 			Code:           "XMinioLockVersionMismatch",
 			Description:    desc,
-			HTTPStatusCode: http.StatusBadRequest,
+			HTTPStatusCode: http.StatusUpgradeRequired,
 		}, r.URL)
 	case strings.HasPrefix(r.URL.Path, adminPathPrefix):
 		var desc string
@@ -431,7 +465,7 @@ func errorResponseHandler(w http.ResponseWriter, r *http.Request) {
 		writeErrorResponseJSON(r.Context(), w, APIError{
 			Code:           "XMinioAdminVersionMismatch",
 			Description:    desc,
-			HTTPStatusCode: http.StatusBadRequest,
+			HTTPStatusCode: http.StatusUpgradeRequired,
 		}, r.URL)
 	default:
 		desc := fmt.Sprintf("Unknown API request at %s", r.URL.Path)
@@ -450,5 +484,36 @@ func getHostName(r *http.Request) (hostName string) {
 	} else {
 		hostName = r.Host
 	}
+	return
+}
+
+// Proxy any request to an endpoint.
+func proxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, ep ProxyEndpoint) (success bool) {
+	success = true
+
+	// Make sure we remove any existing headers before
+	// proxying the request to another node.
+	for k := range w.Header() {
+		w.Header().Del(k)
+	}
+
+	f := handlers.NewForwarder(&handlers.Forwarder{
+		PassHost:     true,
+		RoundTripper: ep.Transport,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			success = false
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.LogIf(GlobalContext, err)
+			}
+		},
+	})
+
+	r.URL.Scheme = "http"
+	if globalIsSSL {
+		r.URL.Scheme = "https"
+	}
+
+	r.URL.Host = ep.Host
+	f.ServeHTTP(w, r)
 	return
 }

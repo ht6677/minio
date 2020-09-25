@@ -16,6 +16,7 @@ This document explains how to setup Prometheus and configure it to scrape data f
         - [3.2 Public Prometheus config](#32-public-prometheus-config)
     - [4. Update `scrape_configs` section in prometheus.yml](#4-update-scrapeconfigs-section-in-prometheusyml)
     - [5. Start Prometheus](#5-start-prometheus)
+    - [6. Configure Grafana](#6-configure-grafana)
 - [List of metrics exposed by MinIO](#list-of-metrics-exposed-by-minio)
 
 ## Prerequisites
@@ -100,6 +101,10 @@ Start (or) Restart Prometheus service by running
 
 Here `prometheus.yml` is the name of configuration file. You can now see MinIO metrics in Prometheus dashboard. By default Prometheus dashboard is accessible at `http://localhost:9090`.
 
+### 6. Configure Grafana
+
+After Prometheus is configured, you can use Grafana to visualize MinIO metrics. Refer the [document here to setup Grafana with MinIO prometheus metrics](https://github.com/minio/minio/blob/master/docs/metrics/prometheus/grafana/README.md).
+
 ## List of metrics exposed by MinIO
 
 MinIO server exposes the following metrics on `/minio/prometheus/metrics` endpoint. All of these can be accessed via Prometheus dashboard. The full list of exposed metrics along with their definition is available in the demo server at https://play.min.io:9000/minio/prometheus/metrics
@@ -110,7 +115,7 @@ These are the new set of metrics which will be in effect after `RELEASE.2019-10-
     - Metrics that records the http statistics and latencies are labeled to their respective APIs (putobject,getobject etc).
     - Disk usage metrics are distributed and labeled to the respective disk paths.
 
-For more details, please check the `Migration guide for the new set of metrics`. 
+For more details, please check the `Migration guide for the new set of metrics`.
 
 The list of metrics and its definition are as follows. (NOTE: instance here is one MinIO node)
 
@@ -178,14 +183,23 @@ All metrics are labeled by `bucket`, each metric is displayed per bucket. `bucke
 
 MinIO Gateway instances enabled with Disk-Caching expose caching related metrics.
 
-| name                 | description                             |
-|:---------------------|:----------------------------------------|
-| `cache_data_served`  | Total number of bytes served from cache |
-| `cache_hits_total`   | Total number of cache hits              |
-| `cache_misses_total` | Total number of cache misses            |
+#### Global cache metrics
+| name                 | description                                       |
+|:---------------------|:--------------------------------------------------|
+| `cache_hits_total`   | Total number of cache hits                        |
+| `cache_misses_total` | Total number of cache misses                      |
+| `cache_data_served`  | Total number of bytes served from cache           |
 
-### Gateway & Cache specific metrics
+#### Per disk cache metrics
+| `cache_usage_percent` | Total percentage cache usage                                                     |
+| `cache_usage_state`   | Indicates cache usage is high or low, relative to current cache 'quota' settings |
 
+`cache_usage_state` holds only two states
+
+- '1' indicates high disk usage
+- '0' indicates low disk usage
+
+### Gateway specific metrics
 MinIO Gateway instance exposes metrics related to Gateway communication with the cloud backend (S3, Azure & GCS Gateway).
 
 `<gateway_type>` changes based on the gateway in use can be 's3', 'gcs' or 'azure'. Other metrics are labeled with `method` that identifies HTTP GET, HEAD, PUT and POST requests to the backend.

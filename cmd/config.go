@@ -23,7 +23,7 @@ import (
 	"path"
 	"sort"
 	"strings"
-	"time"
+	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio/cmd/config"
@@ -64,7 +64,7 @@ func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData b
 				if err != nil {
 					return nil, err
 				}
-				if globalConfigEncrypted {
+				if globalConfigEncrypted && !utf8.Valid(data) {
 					data, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(data))
 					if err != nil {
 						return nil, err
@@ -103,7 +103,7 @@ func readServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV str
 		return nil, err
 	}
 
-	if globalConfigEncrypted {
+	if globalConfigEncrypted && !utf8.Valid(data) {
 		data, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(data))
 	}
 
@@ -150,13 +150,13 @@ func readServerConfig(ctx context.Context, objAPI ObjectLayer) (config.Config, e
 	if err != nil {
 		// Config not found for some reason, allow things to continue
 		// by initializing a new fresh config in safe mode.
-		if err == errConfigNotFound && globalSafeMode {
+		if err == errConfigNotFound && newObjectLayerFn() == nil {
 			return newServerConfig(), nil
 		}
 		return nil, err
 	}
 
-	if globalConfigEncrypted {
+	if globalConfigEncrypted && !utf8.Valid(configData) {
 		configData, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(configData))
 		if err != nil {
 			if err == madmin.ErrMaliciousData {
@@ -182,23 +182,6 @@ type ConfigSys struct{}
 // Load - load config.json.
 func (sys *ConfigSys) Load(objAPI ObjectLayer) error {
 	return sys.Init(objAPI)
-}
-
-// WatchConfigNASDisk - watches nas disk on periodic basis.
-func (sys *ConfigSys) WatchConfigNASDisk(ctx context.Context, objAPI ObjectLayer) {
-	configInterval := globalRefreshIAMInterval
-	watchDisk := func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(configInterval):
-				loadConfig(objAPI)
-			}
-		}
-	}
-	// Refresh configSys in background for NAS gateway.
-	go watchDisk()
 }
 
 // Init - initializes config system from config.json.

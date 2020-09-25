@@ -23,7 +23,7 @@ import (
 	"testing"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/minio-go/v6/pkg/encrypt"
+	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio/cmd/crypto"
 	"github.com/minio/sio"
 )
@@ -80,44 +80,49 @@ func TestEncryptRequest(t *testing.T) {
 
 var decryptObjectInfoTests = []struct {
 	info    ObjectInfo
-	headers http.Header
+	request *http.Request
 	expErr  error
 }{
 	{
 		info:    ObjectInfo{Size: 100},
-		headers: http.Header{},
+		request: &http.Request{Header: http.Header{}},
 		expErr:  nil,
 	},
 	{
 		info:    ObjectInfo{Size: 100, UserDefined: map[string]string{crypto.SSESealAlgorithm: crypto.InsecureSealAlgorithm}},
-		headers: http.Header{crypto.SSECAlgorithm: []string{crypto.SSEAlgorithmAES256}},
+		request: &http.Request{Header: http.Header{crypto.SSECAlgorithm: []string{crypto.SSEAlgorithmAES256}}},
 		expErr:  nil,
 	},
 	{
 		info:    ObjectInfo{Size: 0, UserDefined: map[string]string{crypto.SSESealAlgorithm: crypto.InsecureSealAlgorithm}},
-		headers: http.Header{crypto.SSECAlgorithm: []string{crypto.SSEAlgorithmAES256}},
+		request: &http.Request{Header: http.Header{crypto.SSECAlgorithm: []string{crypto.SSEAlgorithmAES256}}},
 		expErr:  nil,
 	},
 	{
 		info:    ObjectInfo{Size: 100, UserDefined: map[string]string{crypto.SSECSealedKey: "EAAfAAAAAAD7v1hQq3PFRUHsItalxmrJqrOq6FwnbXNarxOOpb8jTWONPPKyM3Gfjkjyj6NCf+aB/VpHCLCTBA=="}},
-		headers: http.Header{},
+		request: &http.Request{Header: http.Header{}},
 		expErr:  errEncryptedObject,
 	},
 	{
 		info:    ObjectInfo{Size: 100, UserDefined: map[string]string{}},
-		headers: http.Header{crypto.SSECAlgorithm: []string{crypto.SSEAlgorithmAES256}},
+		request: &http.Request{Method: http.MethodGet, Header: http.Header{crypto.SSECAlgorithm: []string{crypto.SSEAlgorithmAES256}}},
+		expErr:  errInvalidEncryptionParameters,
+	},
+	{
+		info:    ObjectInfo{Size: 100, UserDefined: map[string]string{}},
+		request: &http.Request{Method: http.MethodHead, Header: http.Header{crypto.SSECAlgorithm: []string{crypto.SSEAlgorithmAES256}}},
 		expErr:  errInvalidEncryptionParameters,
 	},
 	{
 		info:    ObjectInfo{Size: 31, UserDefined: map[string]string{crypto.SSESealAlgorithm: crypto.InsecureSealAlgorithm}},
-		headers: http.Header{crypto.SSECAlgorithm: []string{crypto.SSEAlgorithmAES256}},
+		request: &http.Request{Header: http.Header{crypto.SSECAlgorithm: []string{crypto.SSEAlgorithmAES256}}},
 		expErr:  errObjectTampered,
 	},
 }
 
 func TestDecryptObjectInfo(t *testing.T) {
 	for i, test := range decryptObjectInfoTests {
-		if encrypted, err := DecryptObjectInfo(&test.info, test.headers); err != test.expErr {
+		if encrypted, err := DecryptObjectInfo(&test.info, test.request); err != test.expErr {
 			t.Errorf("Test %d: Decryption returned wrong error code: got %d , want %d", i, err, test.expErr)
 		} else if enc := crypto.IsEncrypted(test.info.UserDefined); encrypted && enc != encrypted {
 			t.Errorf("Test %d: Decryption thinks object is encrypted but it is not", i)
@@ -368,7 +373,7 @@ func TestGetDecryptedRange(t *testing.T) {
 			sum := int64(0)
 			for i, s := range sizes {
 				r[i].Number = i
-				r[i].Size = int64(getEncSize(s))
+				r[i].Size = getEncSize(s)
 				sum += r[i].Size
 			}
 			return ObjectInfo{

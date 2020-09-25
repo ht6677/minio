@@ -23,6 +23,7 @@ const (
 )
 
 const (
+	storageRESTMethodHealth               = "/health"
 	storageRESTMethodDiskInfo             = "/diskinfo"
 	storageRESTMethodCrawlAndGetDataUsage = "/crawlandgetdatausage"
 	storageRESTMethodMakeVol              = "/makevol"
@@ -60,7 +61,6 @@ const (
 	storageRESTFilePath      = "file-path"
 	storageRESTVersionID     = "version-id"
 	storageRESTTotalVersions = "total-versions"
-	storageRESTDeleteMarker  = "delete-marker"
 	storageRESTSrcVolume     = "source-volume"
 	storageRESTSrcPath       = "source-path"
 	storageRESTDataDir       = "data-dir"

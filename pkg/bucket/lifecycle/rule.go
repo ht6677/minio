@@ -19,6 +19,8 @@ package lifecycle
 import (
 	"bytes"
 	"encoding/xml"
+
+	"github.com/google/uuid"
 )
 
 // Status represents lifecycle configuration status
@@ -44,16 +46,33 @@ type Rule struct {
 }
 
 var (
-	errInvalidRuleID           = Errorf("ID must be less than 255 characters")
-	errEmptyRuleStatus         = Errorf("Status should not be empty")
-	errInvalidRuleStatus       = Errorf("Status must be set to either Enabled or Disabled")
-	errMissingExpirationAction = Errorf("No expiration action found")
+	errInvalidRuleID     = Errorf("ID length is limited to 255 characters")
+	errEmptyRuleStatus   = Errorf("Status should not be empty")
+	errInvalidRuleStatus = Errorf("Status must be set to either Enabled or Disabled")
 )
+
+// generates random UUID
+func getNewUUID() (string, error) {
+	u, err := uuid.NewRandom()
+	if err != nil {
+		return "", err
+	}
+
+	return u.String(), nil
+}
 
 // validateID - checks if ID is valid or not.
 func (r Rule) validateID() error {
+	IDLen := len(string(r.ID))
+	// generate new ID when not provided
 	// cannot be longer than 255 characters
-	if len(string(r.ID)) > 255 {
+	if IDLen == 0 {
+		if newID, err := getNewUUID(); err == nil {
+			r.ID = newID
+		} else {
+			return err
+		}
+	} else if IDLen > 255 {
 		return errInvalidRuleID
 	}
 	return nil
@@ -74,10 +93,7 @@ func (r Rule) validateStatus() error {
 }
 
 func (r Rule) validateAction() error {
-	if r.Expiration == (Expiration{}) {
-		return errMissingExpirationAction
-	}
-	return nil
+	return r.Expiration.Validate()
 }
 
 func (r Rule) validateFilter() error {

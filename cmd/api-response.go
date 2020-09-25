@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/xml"
+	"fmt"
 	"net/http"
 	"net/url"
 	"path"
@@ -35,7 +36,7 @@ import (
 const (
 	// RFC3339 a subset of the ISO8601 timestamp format. e.g 2014-04-29T18:30:38Z
 	iso8601TimeFormat = "2006-01-02T15:04:05.000Z" // Reply date format with nanosecond precision.
-	maxObjectList     = 50000                      // Limit number of objects in a listObjectsResponse/listObjectsVersionsResponse.
+	maxObjectList     = 1000                       // Limit number of objects in a listObjectsResponse/listObjectsVersionsResponse.
 	maxDeleteList     = 10000                      // Limit number of objects deleted in a delete call.
 	maxUploadsList    = 10000                      // Limit number of uploads in a listUploadsResponse.
 	maxPartsList      = 10000                      // Limit number of parts in a listPartsResponse.
@@ -81,7 +82,6 @@ type ListVersionsResponse struct {
 
 	CommonPrefixes []CommonPrefix
 	Versions       []ObjectVersion
-	DeleteMarkers  []DeletedVersion
 
 	// Encoding type used to encode object keys in the response.
 	EncodingType string `xml:"EncodingType,omitempty"`
@@ -236,24 +236,23 @@ type Bucket struct {
 
 // ObjectVersion container for object version metadata
 type ObjectVersion struct {
-	XMLName xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ Version" json:"-"`
 	Object
 	IsLatest  bool
 	VersionID string `xml:"VersionId"`
+
+	isDeleteMarker bool
 }
 
-// DeletedVersion container for the delete object version metadata.
-type DeletedVersion struct {
-	XMLName xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ DeleteMarker" json:"-"`
+// MarshalXML - marshal ObjectVersion
+func (o ObjectVersion) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	if o.isDeleteMarker {
+		start.Name.Local = "DeleteMarker"
+	} else {
+		start.Name.Local = "Version"
+	}
 
-	IsLatest     bool
-	Key          string
-	LastModified string // time string of format "2006-01-02T15:04:05.000Z"
-
-	// Owner of the object.
-	Owner Owner
-
-	VersionID string `xml:"VersionId"`
+	type objectVersionWrapper ObjectVersion
+	return e.EncodeElement(objectVersionWrapper(o), start)
 }
 
 // StringMap is a map[string]string.
@@ -398,8 +397,7 @@ func getObjectLocation(r *http.Request, domains []string, bucket, object string)
 	}
 	// If domain is set then we need to use bucket DNS style.
 	for _, domain := range domains {
-		if strings.Contains(r.Host, domain) {
-			u.Host = bucket + "." + r.Host
+		if strings.HasPrefix(r.Host, bucket+"."+domain) {
 			u.Path = path.Join(SlashSeparator, object)
 			break
 		}
@@ -410,7 +408,7 @@ func getObjectLocation(r *http.Request, domains []string, bucket, object string)
 // generates ListBucketsResponse from array of BucketInfo which can be
 // serialized to match XML and JSON API spec output.
 func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
-	var listbuckets []Bucket
+	listbuckets := make([]Bucket, 0, len(buckets))
 	var data = ListBucketsResponse{}
 	var owner = Owner{}
 
@@ -430,9 +428,7 @@ func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
 
 // generates an ListBucketVersions response for the said bucket with other enumerated options.
 func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delimiter, encodingType string, maxKeys int, resp ListObjectVersionsInfo) ListVersionsResponse {
-	var versions []ObjectVersion
-	var deletedVersions []DeletedVersion
-	var prefixes []CommonPrefix
+	versions := make([]ObjectVersion, 0, len(resp.Objects))
 	var owner = Owner{}
 	var data = ListVersionsResponse{}
 
@@ -459,23 +455,12 @@ func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delim
 			content.VersionID = nullVersionID
 		}
 		content.IsLatest = object.IsLatest
+		content.isDeleteMarker = object.DeleteMarker
 		versions = append(versions, content)
-	}
-
-	for _, deleted := range resp.DeleteObjects {
-		var dv = DeletedVersion{
-			Key:          s3EncodeName(deleted.Name, encodingType),
-			Owner:        owner,
-			LastModified: deleted.ModTime.UTC().Format(iso8601TimeFormat),
-			VersionID:    deleted.VersionID,
-			IsLatest:     deleted.IsLatest,
-		}
-		deletedVersions = append(deletedVersions, dv)
 	}
 
 	data.Name = bucket
 	data.Versions = versions
-	data.DeleteMarkers = deletedVersions
 	data.EncodingType = encodingType
 	data.Prefix = s3EncodeName(prefix, encodingType)
 	data.KeyMarker = s3EncodeName(marker, encodingType)
@@ -487,6 +472,7 @@ func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delim
 	data.VersionIDMarker = versionIDMarker
 	data.IsTruncated = resp.IsTruncated
 
+	prefixes := make([]CommonPrefix, 0, len(resp.Prefixes))
 	for _, prefix := range resp.Prefixes {
 		var prefixItem = CommonPrefix{}
 		prefixItem.Prefix = s3EncodeName(prefix, encodingType)
@@ -498,8 +484,7 @@ func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delim
 
 // generates an ListObjectsV1 response for the said bucket with other enumerated options.
 func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingType string, maxKeys int, resp ListObjectsInfo) ListObjectsResponse {
-	var contents []Object
-	var prefixes []CommonPrefix
+	contents := make([]Object, 0, len(resp.Objects))
 	var owner = Owner{}
 	var data = ListObjectsResponse{}
 
@@ -531,9 +516,10 @@ func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingTy
 	data.Marker = s3EncodeName(marker, encodingType)
 	data.Delimiter = s3EncodeName(delimiter, encodingType)
 	data.MaxKeys = maxKeys
-
 	data.NextMarker = s3EncodeName(resp.NextMarker, encodingType)
 	data.IsTruncated = resp.IsTruncated
+
+	prefixes := make([]CommonPrefix, 0, len(resp.Prefixes))
 	for _, prefix := range resp.Prefixes {
 		var prefixItem = CommonPrefix{}
 		prefixItem.Prefix = s3EncodeName(prefix, encodingType)
@@ -545,8 +531,7 @@ func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingTy
 
 // generates an ListObjectsV2 response for the said bucket with other enumerated options.
 func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter, delimiter, encodingType string, fetchOwner, isTruncated bool, maxKeys int, objects []ObjectInfo, prefixes []string, metadata bool) ListObjectsV2Response {
-	var contents []Object
-	var commonPrefixes []CommonPrefix
+	contents := make([]Object, 0, len(objects))
 	var owner = Owner{}
 	var data = ListObjectsV2Response{}
 
@@ -579,6 +564,10 @@ func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter,
 					// values to client.
 					continue
 				}
+				// https://github.com/google/security-research/security/advisories/GHSA-76wf-9vgp-pj7w
+				if strings.EqualFold(k, xhttp.AmzMetaUnencryptedContentLength) || strings.EqualFold(k, xhttp.AmzMetaUnencryptedContentMD5) {
+					continue
+				}
 				content.UserMetadata[k] = v
 			}
 		}
@@ -595,6 +584,8 @@ func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter,
 	data.ContinuationToken = base64.StdEncoding.EncodeToString([]byte(token))
 	data.NextContinuationToken = base64.StdEncoding.EncodeToString([]byte(nextToken))
 	data.IsTruncated = isTruncated
+
+	commonPrefixes := make([]CommonPrefix, 0, len(prefixes))
 	for _, prefix := range prefixes {
 		var prefixItem = CommonPrefix{}
 		prefixItem.Prefix = s3EncodeName(prefix, encodingType)
@@ -712,6 +703,10 @@ func generateMultiDeleteResponse(quiet bool, deletedObjects []DeletedObject, err
 }
 
 func writeResponse(w http.ResponseWriter, statusCode int, response []byte, mType mimeType) {
+	if newObjectLayerFn() == nil {
+		// Server still in safe mode.
+		w.Header().Set(xhttp.MinIOServerStatus, "safemode")
+	}
 	setCommonHeaders(w)
 	if mType != mimeNone {
 		w.Header().Set(xhttp.ContentType, string(mType))
@@ -770,10 +765,18 @@ func writeErrorResponse(ctx context.Context, w http.ResponseWriter, err APIError
 		// Set retry-after header to indicate user-agents to retry request after 120secs.
 		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
 		w.Header().Set(xhttp.RetryAfter, "120")
+	case "InvalidRegion":
+		err.Description = fmt.Sprintf("Region does not match; expecting '%s'.", globalServerRegion)
+	case "AuthorizationHeaderMalformed":
+		err.Description = fmt.Sprintf("The authorization header is malformed; the region is wrong; expecting '%s'.", globalServerRegion)
 	case "AccessDenied":
 		// The request is from browser and also if browser
 		// is enabled we need to redirect.
 		if browser && globalBrowserEnabled {
+			if newObjectLayerFn() == nil {
+				// server still in safe mode.
+				w.Header().Set(xhttp.MinIOServerStatus, "safemode")
+			}
 			w.Header().Set(xhttp.Location, minioReservedBucketPath+reqURL.Path)
 			w.WriteHeader(http.StatusTemporaryRedirect)
 			return
@@ -823,39 +826,4 @@ func writeCustomErrorResponseJSON(ctx context.Context, w http.ResponseWriter, er
 	}
 	encodedErrorResponse := encodeResponseJSON(errorResponse)
 	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeJSON)
-}
-
-// writeCustomErrorResponseXML - similar to writeErrorResponse,
-// but accepts the error message directly (this allows messages to be
-// dynamically generated.)
-func writeCustomErrorResponseXML(ctx context.Context, w http.ResponseWriter, err APIError, errBody string, reqURL *url.URL, browser bool) {
-
-	switch err.Code {
-	case "SlowDown", "XMinioServerNotInitialized", "XMinioReadQuorum", "XMinioWriteQuorum":
-		// Set retry-after header to indicate user-agents to retry request after 120secs.
-		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
-		w.Header().Set(xhttp.RetryAfter, "120")
-	case "AccessDenied":
-		// The request is from browser and also if browser
-		// is enabled we need to redirect.
-		if browser && globalBrowserEnabled {
-			w.Header().Set(xhttp.Location, minioReservedBucketPath+reqURL.Path)
-			w.WriteHeader(http.StatusTemporaryRedirect)
-			return
-		}
-	}
-
-	reqInfo := logger.GetReqInfo(ctx)
-	errorResponse := APIErrorResponse{
-		Code:       err.Code,
-		Message:    errBody,
-		Resource:   reqURL.Path,
-		BucketName: reqInfo.BucketName,
-		Key:        reqInfo.ObjectName,
-		RequestID:  w.Header().Get(xhttp.AmzRequestID),
-		HostID:     globalDeploymentID,
-	}
-
-	encodedErrorResponse := encodeResponse(errorResponse)
-	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeXML)
 }

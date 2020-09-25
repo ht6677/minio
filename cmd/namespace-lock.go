@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/minio/minio/cmd/config/storageclass"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/dsync"
 	"github.com/minio/minio/pkg/lsync"
@@ -79,7 +80,7 @@ func (n *nsLockMap) lock(ctx context.Context, volume string, path string, lockSo
 	nsLk, found := n.lockMap[resource]
 	if !found {
 		nsLk = &nsLock{
-			LRWMutex: lsync.NewLRWMutex(ctx),
+			LRWMutex: lsync.NewLRWMutex(),
 		}
 		// Add a count to indicate that a parallel unlock doesn't clear this entry.
 	}
@@ -89,9 +90,9 @@ func (n *nsLockMap) lock(ctx context.Context, volume string, path string, lockSo
 
 	// Locking here will block (until timeout).
 	if readLock {
-		locked = nsLk.GetRLock(opsID, lockSource, timeout)
+		locked = nsLk.GetRLock(ctx, opsID, lockSource, timeout)
 	} else {
-		locked = nsLk.GetLock(opsID, lockSource, timeout)
+		locked = nsLk.GetLock(ctx, opsID, lockSource, timeout)
 	}
 
 	if !locked { // We failed to get the lock
@@ -139,6 +140,7 @@ func (n *nsLockMap) unlock(volume string, path string, readLock bool) {
 type distLockInstance struct {
 	rwMutex *dsync.DRWMutex
 	opsID   string
+	ctx     context.Context
 }
 
 // Lock - block until write lock is taken or timeout has occurred.
@@ -146,7 +148,18 @@ func (di *distLockInstance) GetLock(timeout *dynamicTimeout) (timedOutErr error)
 	lockSource := getSource(2)
 	start := UTCNow()
 
-	if !di.rwMutex.GetLock(di.opsID, lockSource, timeout.Timeout()) {
+	// Lockers default to standard storage class always, why because
+	// we always dictate storage tolerance in terms of standard
+	// storage class be it number of drives or a multiplicative
+	// of number of nodes, defaulting lockers to this value
+	// simply means that locking is always similar in behavior
+	// and effect with erasure coded drive tolerance.
+	tolerance := globalStorageClass.GetParityForSC(storageclass.STANDARD)
+
+	if !di.rwMutex.GetLock(di.ctx, di.opsID, lockSource, dsync.Options{
+		Timeout:   timeout.Timeout(),
+		Tolerance: tolerance,
+	}) {
 		timeout.LogFailure()
 		return OperationTimedOut{}
 	}
@@ -163,7 +176,14 @@ func (di *distLockInstance) Unlock() {
 func (di *distLockInstance) GetRLock(timeout *dynamicTimeout) (timedOutErr error) {
 	lockSource := getSource(2)
 	start := UTCNow()
-	if !di.rwMutex.GetRLock(di.opsID, lockSource, timeout.Timeout()) {
+
+	// Lockers default to standard storage class always.
+	tolerance := globalStorageClass.GetParityForSC(storageclass.STANDARD)
+
+	if !di.rwMutex.GetRLock(di.ctx, di.opsID, lockSource, dsync.Options{
+		Timeout:   timeout.Timeout(),
+		Tolerance: tolerance,
+	}) {
 		timeout.LogFailure()
 		return OperationTimedOut{}
 	}
@@ -191,10 +211,10 @@ type localLockInstance struct {
 func (n *nsLockMap) NewNSLock(ctx context.Context, lockersFn func() []dsync.NetLocker, volume string, paths ...string) RWLocker {
 	opsID := mustGetUUID()
 	if n.isDistErasure {
-		drwmutex := dsync.NewDRWMutex(ctx, &dsync.Dsync{
+		drwmutex := dsync.NewDRWMutex(&dsync.Dsync{
 			GetLockersFn: lockersFn,
 		}, pathsJoinPrefix(volume, paths...)...)
-		return &distLockInstance{drwmutex, opsID}
+		return &distLockInstance{drwmutex, opsID, ctx}
 	}
 	sort.Strings(paths)
 	return &localLockInstance{ctx, n, volume, paths, opsID}

@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/bpool"
+	"github.com/minio/minio/pkg/color"
 	"github.com/minio/minio/pkg/dsync"
 	"github.com/minio/minio/pkg/madmin"
 	"github.com/minio/minio/pkg/sync/errgroup"
@@ -33,11 +35,12 @@ import (
 // OfflineDisk represents an unavailable disk.
 var OfflineDisk StorageAPI // zero value is nil
 
-// partialUpload is a successful upload of an object
+// partialOperation is a successful upload/delete of an object
 // but not written in all disks (having quorum)
-type partialUpload struct {
+type partialOperation struct {
 	bucket    string
 	object    string
+	versionID string
 	failedSet int
 }
 
@@ -61,7 +64,7 @@ type erasureObjects struct {
 	// Byte pools used for temporary i/o buffers.
 	bp *bpool.BytePoolCap
 
-	mrfUploadCh chan partialUpload
+	mrfOpCh chan partialOperation
 }
 
 // NewNSLock - initialize a new namespace RWLocker instance.
@@ -69,38 +72,66 @@ func (er erasureObjects) NewNSLock(ctx context.Context, bucket string, objects .
 	return er.nsMutex.NewNSLock(ctx, er.getLockers, bucket, objects...)
 }
 
+// SetDriveCount returns the current drives per set.
+func (er erasureObjects) SetDriveCount() int {
+	return len(er.getDisks())
+}
+
 // Shutdown function for object storage interface.
 func (er erasureObjects) Shutdown(ctx context.Context) error {
 	// Add any object layer shutdown activities here.
 	closeStorageDisks(er.getDisks())
+	select {
+	case _, ok := <-er.mrfOpCh:
+		if ok {
+			close(er.mrfOpCh)
+		}
+	default:
+		close(er.mrfOpCh)
+	}
 	return nil
 }
 
 // byDiskTotal is a collection satisfying sort.Interface.
-type byDiskTotal []DiskInfo
+type byDiskTotal []madmin.Disk
 
 func (d byDiskTotal) Len() int      { return len(d) }
 func (d byDiskTotal) Swap(i, j int) { d[i], d[j] = d[j], d[i] }
 func (d byDiskTotal) Less(i, j int) bool {
-	return d[i].Total < d[j].Total
+	return d[i].TotalSpace < d[j].TotalSpace
+}
+
+func diskErrToDriveState(err error) (state string) {
+	state = madmin.DriveStateUnknown
+	switch {
+	case errors.Is(err, errDiskNotFound):
+		state = madmin.DriveStateOffline
+	case errors.Is(err, errCorruptedFormat):
+		state = madmin.DriveStateCorrupt
+	case errors.Is(err, errUnformattedDisk):
+		state = madmin.DriveStateUnformatted
+	case errors.Is(err, errDiskAccessDenied):
+		state = madmin.DriveStatePermission
+	case errors.Is(err, errFaultyDisk):
+		state = madmin.DriveStateFaulty
+	case err == nil:
+		state = madmin.DriveStateOk
+	}
+	return
 }
 
 // getDisksInfo - fetch disks info across all other storage API.
-func getDisksInfo(disks []StorageAPI, local bool) (disksInfo []DiskInfo, errs []error, onlineDisks, offlineDisks madmin.BackendDisks) {
-	disksInfo = make([]DiskInfo, len(disks))
+func getDisksInfo(disks []StorageAPI, endpoints []string) (disksInfo []madmin.Disk, errs []error, onlineDisks, offlineDisks madmin.BackendDisks) {
+	disksInfo = make([]madmin.Disk, len(disks))
 	onlineDisks = make(madmin.BackendDisks)
 	offlineDisks = make(madmin.BackendDisks)
 
-	for _, disk := range disks {
-		if disk == OfflineDisk {
-			continue
+	for _, ep := range endpoints {
+		if _, ok := offlineDisks[ep]; !ok {
+			offlineDisks[ep] = 0
 		}
-		peerAddr := disk.Hostname()
-		if _, ok := offlineDisks[peerAddr]; !ok {
-			offlineDisks[peerAddr] = 0
-		}
-		if _, ok := onlineDisks[peerAddr]; !ok {
-			onlineDisks[peerAddr] = 0
+		if _, ok := onlineDisks[ep]; !ok {
+			onlineDisks[ep] = 0
 		}
 	}
 
@@ -109,87 +140,87 @@ func getDisksInfo(disks []StorageAPI, local bool) (disksInfo []DiskInfo, errs []
 		index := index
 		g.Go(func() error {
 			if disks[index] == OfflineDisk {
+				logger.LogIf(GlobalContext, fmt.Errorf("%s: %s", errDiskNotFound, endpoints[index]))
+				disksInfo[index] = madmin.Disk{
+					State:    diskErrToDriveState(errDiskNotFound),
+					Endpoint: endpoints[index],
+				}
 				// Storage disk is empty, perhaps ignored disk or not available.
 				return errDiskNotFound
 			}
-			info, err := disks[index].DiskInfo()
+			info, err := disks[index].DiskInfo(context.TODO())
 			if err != nil {
-				if !IsErr(err, baseErrs...) {
-					reqInfo := (&logger.ReqInfo{}).AppendTags("disk", disks[index].String())
-					ctx := logger.SetReqInfo(GlobalContext, reqInfo)
-					logger.LogIf(ctx, err)
+				reqInfo := (&logger.ReqInfo{}).AppendTags("disk", disks[index].String())
+				ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+				logger.LogIf(ctx, err)
+				disksInfo[index] = madmin.Disk{
+					State:    diskErrToDriveState(err),
+					Endpoint: endpoints[index],
 				}
 				return err
 			}
-			disksInfo[index] = info
-			return nil
+			di := madmin.Disk{
+				Endpoint:       endpoints[index],
+				DrivePath:      info.MountPath,
+				TotalSpace:     info.Total,
+				UsedSpace:      info.Used,
+				AvailableSpace: info.Free,
+				UUID:           info.ID,
+				RootDisk:       info.RootDisk,
+				State:          diskErrToDriveState(err),
+			}
+			if info.Total > 0 {
+				di.Utilization = float64(info.Used / info.Total * 100)
+			}
+			disksInfo[index] = di
+			return err
 		}, index)
 	}
 
 	errs = g.Wait()
 	// Wait for the routines.
 	for i, diskInfoErr := range errs {
-		if disks[i] == OfflineDisk {
-			continue
-		}
+		ep := disksInfo[i].Endpoint
 		if diskInfoErr != nil {
-			offlineDisks[disks[i].Hostname()]++
+			offlineDisks[ep]++
 			continue
 		}
-		onlineDisks[disks[i].Hostname()]++
+		onlineDisks[ep]++
 	}
 
-	// Iterate over the passed endpoints arguments and check
-	// if there are still disks missing from the offline/online lists
-	// and update them accordingly.
-	missingOfflineDisks := make(map[string]int)
-	for _, zone := range globalEndpoints {
-		for _, endpoint := range zone.Endpoints {
-			// if local is set and endpoint is not local
-			// we are not interested in remote disks.
-			if local && !endpoint.IsLocal {
-				continue
-			}
-
-			if _, ok := offlineDisks[endpoint.Host]; !ok {
-				missingOfflineDisks[endpoint.Host]++
-			}
+	rootDiskCount := 0
+	for _, di := range disksInfo {
+		if di.RootDisk {
+			rootDiskCount++
 		}
 	}
-	for missingDisk, n := range missingOfflineDisks {
-		onlineDisks[missingDisk] = 0
-		offlineDisks[missingDisk] = n
+
+	if len(disksInfo) == rootDiskCount {
+		// Success.
+		return disksInfo, errs, onlineDisks, offlineDisks
 	}
 
-	// Success.
+	// Root disk should be considered offline
+	for i := range disksInfo {
+		ep := disksInfo[i].Endpoint
+		if disksInfo[i].RootDisk {
+			offlineDisks[ep]++
+			onlineDisks[ep]--
+		}
+	}
+
 	return disksInfo, errs, onlineDisks, offlineDisks
 }
 
 // Get an aggregated storage info across all disks.
-func getStorageInfo(disks []StorageAPI, local bool) (StorageInfo, []error) {
-	disksInfo, errs, onlineDisks, offlineDisks := getDisksInfo(disks, local)
+func getStorageInfo(disks []StorageAPI, endpoints []string) (StorageInfo, []error) {
+	disksInfo, errs, onlineDisks, offlineDisks := getDisksInfo(disks, endpoints)
 
 	// Sort so that the first element is the smallest.
 	sort.Sort(byDiskTotal(disksInfo))
 
-	// Combine all disks to get total usage
-	usedList := make([]uint64, len(disksInfo))
-	totalList := make([]uint64, len(disksInfo))
-	availableList := make([]uint64, len(disksInfo))
-	mountPaths := make([]string, len(disksInfo))
-
-	for i, di := range disksInfo {
-		usedList[i] = di.Used
-		totalList[i] = di.Total
-		availableList[i] = di.Free
-		mountPaths[i] = di.MountPath
-	}
-
 	storageInfo := StorageInfo{
-		Used:       usedList,
-		Total:      totalList,
-		Available:  availableList,
-		MountPaths: mountPaths,
+		Disks: disksInfo,
 	}
 
 	storageInfo.Backend.Type = BackendErasure
@@ -202,52 +233,68 @@ func getStorageInfo(disks []StorageAPI, local bool) (StorageInfo, []error) {
 // StorageInfo - returns underlying storage statistics.
 func (er erasureObjects) StorageInfo(ctx context.Context, local bool) (StorageInfo, []error) {
 	disks := er.getDisks()
+	endpoints := er.getEndpoints()
 	if local {
 		var localDisks []StorageAPI
-		for _, disk := range disks {
+		var localEndpoints []string
+		for i, disk := range disks {
 			if disk != nil {
 				if disk.IsLocal() {
 					// Append this local disk since local flag is true
 					localDisks = append(localDisks, disk)
+					localEndpoints = append(localEndpoints, endpoints[i])
 				}
 			}
 		}
 		disks = localDisks
+		endpoints = localEndpoints
 	}
-	return getStorageInfo(disks, local)
-}
-
-// GetMetrics - is not implemented and shouldn't be called.
-func (er erasureObjects) GetMetrics(ctx context.Context) (*Metrics, error) {
-	logger.LogIf(ctx, NotImplemented{})
-	return &Metrics{}, NotImplemented{}
-}
-
-// CrawlAndGetDataUsage collects usage from all buckets.
-// updates are sent as different parts of the underlying
-// structure has been traversed.
-func (er erasureObjects) CrawlAndGetDataUsage(ctx context.Context, bf *bloomFilter, updates chan<- DataUsageInfo) error {
-	return NotImplemented{API: "CrawlAndGetDataUsage"}
+	return getStorageInfo(disks, endpoints)
 }
 
 // CrawlAndGetDataUsage will start crawling buckets and send updated totals as they are traversed.
 // Updates are sent on a regular basis and the caller *must* consume them.
 func (er erasureObjects) crawlAndGetDataUsage(ctx context.Context, buckets []BucketInfo, bf *bloomFilter, updates chan<- dataUsageCache) error {
-	var disks []StorageAPI
+	if len(buckets) == 0 {
+		return nil
+	}
 
+	// Collect any disk healing.
+	healing, err := getAggregatedBackgroundHealState(ctx)
+	if err != nil {
+		return err
+	}
+
+	healDisks := make(map[string]struct{}, len(healing.HealDisks))
+	for _, disk := range healing.HealDisks {
+		healDisks[disk] = struct{}{}
+	}
+
+	// Collect disks we can use.
+	var disks []StorageAPI
 	for _, d := range er.getLoadBalancedDisks() {
 		if d == nil || !d.IsOnline() {
 			continue
 		}
+		di, err := d.DiskInfo(ctx)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			continue
+		}
+		if _, ok := healDisks[di.Endpoint]; ok {
+			logger.Info(color.Green("data-crawl:")+" Disk %q is Healing, skipping disk.", di.Endpoint)
+			continue
+		}
 		disks = append(disks, d)
 	}
-	if len(disks) == 0 || len(buckets) == 0 {
+	if len(disks) == 0 {
+		logger.Info(color.Green("data-crawl:") + " No disks found, skipping crawl")
 		return nil
 	}
 
 	// Load bucket totals
 	oldCache := dataUsageCache{}
-	err := oldCache.load(ctx, er, dataUsageCacheName)
+	err = oldCache.load(ctx, er, dataUsageCacheName)
 	if err != nil {
 		return err
 	}
@@ -260,6 +307,7 @@ func (er erasureObjects) crawlAndGetDataUsage(ctx context.Context, buckets []Buc
 		},
 		Cache: make(map[string]dataUsageEntry, len(oldCache.Cache)),
 	}
+	bloom := bf.bytes()
 
 	// Put all buckets into channel.
 	bucketCh := make(chan BucketInfo, len(buckets))
@@ -269,12 +317,13 @@ func (er erasureObjects) crawlAndGetDataUsage(ctx context.Context, buckets []Buc
 			bucketCh <- b
 		}
 	}
+
 	// Add existing buckets.
 	for _, b := range buckets {
 		e := oldCache.find(b.Name)
 		if e != nil {
-			bucketCh <- b
 			cache.replace(b.Name, dataUsageRoot, *e)
+			bucketCh <- b
 		}
 	}
 
@@ -342,6 +391,7 @@ func (er erasureObjects) crawlAndGetDataUsage(ctx context.Context, buckets []Buc
 				if cache.Info.Name == "" {
 					cache.Info.Name = bucket.Name
 				}
+				cache.Info.BloomFilter = bloom
 				if cache.Info.Name != bucket.Name {
 					logger.LogIf(ctx, fmt.Errorf("cache name mismatch: %s != %s", cache.Info.Name, bucket.Name))
 					cache.Info = dataUsageCacheInfo{
@@ -354,6 +404,7 @@ func (er erasureObjects) crawlAndGetDataUsage(ctx context.Context, buckets []Buc
 				// Calc usage
 				before := cache.Info.LastUpdate
 				cache, err = disk.CrawlAndGetDataUsage(ctx, cache)
+				cache.Info.BloomFilter = nil
 				if err != nil {
 					logger.LogIf(ctx, err)
 					if cache.Info.LastUpdate.After(before) {
@@ -381,10 +432,4 @@ func (er erasureObjects) crawlAndGetDataUsage(ctx context.Context, buckets []Buc
 	saverWg.Wait()
 
 	return nil
-}
-
-// IsReady - shouldn't be called will panic.
-func (er erasureObjects) IsReady(ctx context.Context) bool {
-	logger.CriticalIf(ctx, NotImplemented{})
-	return true
 }

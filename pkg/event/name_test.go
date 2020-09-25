@@ -28,9 +28,12 @@ func TestNameExpand(t *testing.T) {
 		name           Name
 		expectedResult []Name
 	}{
+		{BucketCreated, []Name{BucketCreated}},
+		{BucketRemoved, []Name{BucketRemoved}},
 		{ObjectAccessedAll, []Name{ObjectAccessedGet, ObjectAccessedHead, ObjectAccessedGetRetention, ObjectAccessedGetLegalHold}},
-		{ObjectCreatedAll, []Name{ObjectCreatedCompleteMultipartUpload, ObjectCreatedCopy, ObjectCreatedPost, ObjectCreatedPut, ObjectCreatedPutRetention, ObjectCreatedPutLegalHold}},
-		{ObjectRemovedAll, []Name{ObjectRemovedDelete}},
+		{ObjectCreatedAll, []Name{ObjectCreatedCompleteMultipartUpload, ObjectCreatedCopy,
+			ObjectCreatedPost, ObjectCreatedPut, ObjectCreatedPutRetention, ObjectCreatedPutLegalHold}},
+		{ObjectRemovedAll, []Name{ObjectRemovedDelete, ObjectRemovedDeleteMarkerCreated}},
 		{ObjectAccessedHead, []Name{ObjectAccessedHead}},
 	}
 
@@ -50,6 +53,8 @@ func TestNameString(t *testing.T) {
 		name           Name
 		expectedResult string
 	}{
+		{BucketCreated, "s3:BucketCreated:*"},
+		{BucketRemoved, "s3:BucketRemoved:*"},
 		{ObjectAccessedAll, "s3:ObjectAccessed:*"},
 		{ObjectAccessedGet, "s3:ObjectAccessed:Get"},
 		{ObjectAccessedHead, "s3:ObjectAccessed:Head"},

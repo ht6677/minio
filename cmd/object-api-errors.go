@@ -22,12 +22,18 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"strings"
 )
 
 // Converts underlying storage error. Convenience function written to
 // handle all cases where we have known types of errors returned by
 // underlying storage layer.
 func toObjectErr(err error, params ...string) error {
+	if len(params) > 1 {
+		if HasSuffix(params[1], globalDirSuffix) {
+			params[1] = strings.TrimSuffix(params[1], globalDirSuffix) + slashSeparator
+		}
+	}
 	switch err {
 	case errVolumeNotFound:
 		if len(params) >= 1 {
@@ -175,6 +181,17 @@ type GenericError struct {
 	Bucket    string
 	Object    string
 	VersionID string
+	Err       error
+}
+
+// InvalidArgument incorrect input argument
+type InvalidArgument GenericError
+
+func (e InvalidArgument) Error() string {
+	if e.Err != nil {
+		return "Invalid arguments provided for " + e.Bucket + "/" + e.Object + ": (" + e.Err.Error() + ")"
+	}
+	return "Invalid arguments provided for " + e.Bucket + "/" + e.Object
 }
 
 // BucketNotFound bucket does not exist.
@@ -335,6 +352,83 @@ type BucketQuotaExceeded GenericError
 
 func (e BucketQuotaExceeded) Error() string {
 	return "Bucket quota exceeded for bucket: " + e.Bucket
+}
+
+// BucketReplicationConfigNotFound - no bucket replication config found
+type BucketReplicationConfigNotFound GenericError
+
+func (e BucketReplicationConfigNotFound) Error() string {
+	return "The replication configuration was not found: " + e.Bucket
+}
+
+// BucketReplicationDestinationNotFound bucket does not exist.
+type BucketReplicationDestinationNotFound GenericError
+
+func (e BucketReplicationDestinationNotFound) Error() string {
+	return "Destination bucket does not exist: " + e.Bucket
+}
+
+// BucketReplicationDestinationMissingLock bucket does not have object lock enabled.
+type BucketReplicationDestinationMissingLock GenericError
+
+func (e BucketReplicationDestinationMissingLock) Error() string {
+	return "Destination bucket does not have object lock enabled: " + e.Bucket
+}
+
+// BucketRemoteTargetNotFound remote target does not exist.
+type BucketRemoteTargetNotFound GenericError
+
+func (e BucketRemoteTargetNotFound) Error() string {
+	return "Remote target not found: " + e.Bucket
+}
+
+// BucketRemoteConnectionErr remote target connection failure.
+type BucketRemoteConnectionErr GenericError
+
+func (e BucketRemoteConnectionErr) Error() string {
+	return "Remote service endpoint or target bucket not available: " + e.Bucket
+}
+
+// BucketRemoteAlreadyExists remote already exists for this target type.
+type BucketRemoteAlreadyExists GenericError
+
+func (e BucketRemoteAlreadyExists) Error() string {
+	return "Remote already exists for this bucket: " + e.Bucket
+}
+
+// BucketRemoteArnTypeInvalid arn type for remote is not valid.
+type BucketRemoteArnTypeInvalid GenericError
+
+func (e BucketRemoteArnTypeInvalid) Error() string {
+	return "Remote ARN type not valid: " + e.Bucket
+}
+
+// BucketRemoteArnInvalid arn needs to be specified.
+type BucketRemoteArnInvalid GenericError
+
+func (e BucketRemoteArnInvalid) Error() string {
+	return "Remote ARN has invalid format: " + e.Bucket
+}
+
+// BucketRemoteRemoveDisallowed when replication configuration exists
+type BucketRemoteRemoveDisallowed GenericError
+
+func (e BucketRemoteRemoveDisallowed) Error() string {
+	return "Replication configuration exists with this ARN:" + e.Bucket
+}
+
+// BucketReplicationTargetNotVersioned replication target does not have versioning enabled.
+type BucketReplicationTargetNotVersioned GenericError
+
+func (e BucketReplicationTargetNotVersioned) Error() string {
+	return "Replication target does not have versioning enabled: " + e.Bucket
+}
+
+// BucketReplicationSourceNotVersioned replication source does not have versioning enabled.
+type BucketReplicationSourceNotVersioned GenericError
+
+func (e BucketReplicationSourceNotVersioned) Error() string {
+	return "Replication source does not have versioning enabled: " + e.Bucket
 }
 
 /// Bucket related errors.
@@ -517,6 +611,12 @@ func isErrBucketNotFound(err error) bool {
 func isErrObjectNotFound(err error) bool {
 	var objNotFound ObjectNotFound
 	return errors.As(err, &objNotFound)
+}
+
+// isErrVersionNotFound - Check if error type is VersionNotFound.
+func isErrVersionNotFound(err error) bool {
+	var versionNotFound VersionNotFound
+	return errors.As(err, &versionNotFound)
 }
 
 // PreConditionFailed - Check if copy precondition failed

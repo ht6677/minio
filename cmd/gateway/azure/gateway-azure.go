@@ -41,7 +41,7 @@ import (
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/cli"
-	miniogopolicy "github.com/minio/minio-go/v6/pkg/policy"
+	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/bucket/policy"
@@ -70,10 +70,8 @@ const (
 	azureChunkSizeEnvVar        = "MINIO_AZURE_CHUNK_SIZE_MB"
 
 	azureDownloadRetryAttempts = 5
-	azureBlockSize             = 100 * humanize.MiByte
 	azureS3MinPartSize         = 5 * humanize.MiByte
 	metadataObjectNameTemplate = minio.GatewayMinioSysTmp + "multipart/v1/%s.%x/azure.json"
-	azureBackend               = "azure"
 	azureMarkerPrefix          = "{minio}"
 	metadataPartNamePrefix     = minio.GatewayMinioSysTmp + "multipart/v1/%s.%x"
 	maxPartsCount              = 10000
@@ -113,7 +111,7 @@ EXAMPLES:
 `
 
 	minio.RegisterGatewayCommand(cli.Command{
-		Name:               azureBackend,
+		Name:               minio.AzureBackendGateway,
 		Usage:              "Microsoft Azure Blob Storage",
 		Action:             azureGatewayMain,
 		CustomHelpTemplate: azureGatewayTemplate,
@@ -170,7 +168,7 @@ type Azure struct {
 
 // Name implements Gateway interface.
 func (g *Azure) Name() string {
-	return azureBackend
+	return minio.AzureBackendGateway
 }
 
 // NewGatewayLayer initializes azure blob storage client and returns AzureObjects.
@@ -462,6 +460,8 @@ func azureToObjectError(err error, params ...string) error {
 
 func azureCodesToObjectError(err error, serviceCode string, statusCode int, bucket string, object string) error {
 	switch serviceCode {
+	case "ContainerNotFound", "ContainerBeingDeleted":
+		err = minio.BucketNotFound{Bucket: bucket}
 	case "ContainerAlreadyExists":
 		err = minio.BucketExists{Bucket: bucket}
 	case "InvalidResourceName":
@@ -472,6 +472,11 @@ func azureCodesToObjectError(err error, serviceCode string, statusCode int, buck
 		err = minio.UnsupportedMetadata{}
 	case "BlobAccessTierNotSupportedForAccountType":
 		err = minio.NotImplemented{}
+	case "OutOfRangeInput":
+		err = minio.ObjectNameInvalid{
+			Bucket: bucket,
+			Object: object,
+		}
 	default:
 		switch statusCode {
 		case http.StatusNotFound:
@@ -528,7 +533,7 @@ func checkAzureUploadID(ctx context.Context, uploadID string) (err error) {
 func parseAzurePart(metaPartFileName, prefix string) (partID int, err error) {
 	partStr := strings.TrimPrefix(metaPartFileName, prefix+minio.SlashSeparator)
 	if partID, err = strconv.Atoi(partStr); err != nil || partID <= 0 {
-		err = fmt.Errorf("invalid part number in block id '%s'", string(partID))
+		err = fmt.Errorf("invalid part number in block id '%d'", partID)
 		return
 	}
 	return
@@ -874,20 +879,15 @@ func (a *azureObjects) GetObjectInfo(ctx context.Context, bucket, object string,
 // uses Azure equivalent `UploadStreamToBlockBlob`.
 func (a *azureObjects) PutObject(ctx context.Context, bucket, object string, r *minio.PutObjReader, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
 	data := r.Reader
-
-	if data.Size() > azureBlockSize/2 {
-		if len(opts.UserDefined) == 0 {
-			opts.UserDefined = map[string]string{}
-		}
-
-		// Save md5sum for future processing on the object.
-		opts.UserDefined["x-amz-meta-md5sum"] = r.MD5CurrentHexString()
+	if opts.UserDefined == nil {
+		opts.UserDefined = map[string]string{}
 	}
 
 	metadata, properties, err := s3MetaToAzureProperties(ctx, opts.UserDefined)
 	if err != nil {
 		return objInfo, azureToObjectError(err, bucket, object)
 	}
+
 	blobURL := a.client.NewContainerURL(bucket).NewBlockBlobURL(object)
 
 	_, err = azblob.UploadStreamToBlockBlob(ctx, data, blobURL, azblob.UploadStreamToBlockBlobOptions{
@@ -899,14 +899,25 @@ func (a *azureObjects) PutObject(ctx context.Context, bucket, object string, r *
 	if err != nil {
 		return objInfo, azureToObjectError(err, bucket, object)
 	}
-
+	// Query the blob's properties and metadata
+	get, err := blobURL.GetProperties(ctx, azblob.BlobAccessConditions{})
+	if err != nil {
+		return objInfo, azureToObjectError(err, bucket, object)
+	}
+	// Update the blob's metadata with Content-MD5 after the upload
+	metadata = get.NewMetadata()
+	metadata["md5sum"] = r.MD5CurrentHexString()
+	_, err = blobURL.SetMetadata(ctx, metadata, azblob.BlobAccessConditions{})
+	if err != nil {
+		return objInfo, azureToObjectError(err, bucket, object)
+	}
 	return a.GetObjectInfo(ctx, bucket, object, opts)
 }
 
 // CopyObject - Copies a blob from source container to destination container.
 // Uses Azure equivalent `BlobURL.StartCopyFromURL`.
 func (a *azureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
-	if srcOpts.CheckCopyPrecondFn != nil && srcOpts.CheckCopyPrecondFn(srcInfo, "") {
+	if srcOpts.CheckPrecondFn != nil && srcOpts.CheckPrecondFn(srcInfo) {
 		return minio.ObjectInfo{}, minio.PreConditionFailed{}
 	}
 	srcBlob := a.client.NewContainerURL(srcBucket).NewBlobURL(srcObject)
@@ -923,6 +934,7 @@ func (a *azureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, des
 		return objInfo, azureToObjectError(err, srcBucket, srcObject)
 	}
 	props.ContentMD5 = srcProps.ContentMD5()
+	azureMeta["md5sum"] = srcInfo.ETag
 	res, err := destBlob.StartCopyFromURL(ctx, srcBlobURL, azureMeta, azblob.ModifiedAccessConditions{}, azblob.BlobAccessConditions{})
 	if err != nil {
 		return objInfo, azureToObjectError(err, srcBucket, srcObject)
@@ -970,7 +982,10 @@ func (a *azureObjects) DeleteObject(ctx context.Context, bucket, object string, 
 	blob := a.client.NewContainerURL(bucket).NewBlobURL(object)
 	_, err := blob.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{})
 	if err != nil {
-		return minio.ObjectInfo{}, azureToObjectError(err, bucket, object)
+		err = azureToObjectError(err, bucket, object)
+		if !errors.Is(err, minio.ObjectNotFound{Bucket: bucket, Object: object}) {
+			return minio.ObjectInfo{}, err
+		}
 	}
 	return minio.ObjectInfo{
 		Bucket: bucket,
@@ -983,10 +998,8 @@ func (a *azureObjects) DeleteObjects(ctx context.Context, bucket string, objects
 	dobjects := make([]minio.DeletedObject, len(objects))
 	for idx, object := range objects {
 		_, errs[idx] = a.DeleteObject(ctx, bucket, object.ObjectName, opts)
-		if errs[idx] == nil {
-			dobjects[idx] = minio.DeletedObject{
-				ObjectName: object.ObjectName,
-			}
+		dobjects[idx] = minio.DeletedObject{
+			ObjectName: object.ObjectName,
 		}
 	}
 	return dobjects, errs
@@ -1231,7 +1244,7 @@ func (a *azureObjects) ListObjectParts(ctx context.Context, bucket, object, uplo
 // AbortMultipartUpload - Not Implemented.
 // There is no corresponding API in azure to abort an incomplete upload. The uncommmitted blocks
 // gets deleted after one week.
-func (a *azureObjects) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) (err error) {
+func (a *azureObjects) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts minio.ObjectOptions) (err error) {
 	if err = a.checkUploadIDExists(ctx, bucket, object, uploadID); err != nil {
 		return err
 	}
@@ -1432,9 +1445,4 @@ func (a *azureObjects) DeleteBucketPolicy(ctx context.Context, bucket string) er
 // IsCompressionSupported returns whether compression is applicable for this layer.
 func (a *azureObjects) IsCompressionSupported() bool {
 	return false
-}
-
-// IsReady returns whether the layer is ready to take requests.
-func (a *azureObjects) IsReady(ctx context.Context) bool {
-	return minio.IsBackendOnline(ctx, a.httpClient, a.endpoint)
 }

@@ -20,13 +20,27 @@ import (
 	jsoniter "github.com/json-iterator/go"
 )
 
+type versionsSorter []FileInfo
+
+func (v versionsSorter) Len() int      { return len(v) }
+func (v versionsSorter) Swap(i, j int) { v[i], v[j] = v[j], v[i] }
+func (v versionsSorter) Less(i, j int) bool {
+	if v[i].IsLatest {
+		return true
+	}
+	if v[j].IsLatest {
+		return false
+	}
+	return v[i].ModTime.After(v[j].ModTime)
+}
+
 func getFileInfoVersions(xlMetaBuf []byte, volume, path string) (FileInfoVersions, error) {
 	if isXL2V1Format(xlMetaBuf) {
 		var xlMeta xlMetaV2
 		if err := xlMeta.Load(xlMetaBuf); err != nil {
 			return FileInfoVersions{}, err
 		}
-		versions, deletedVersions, latestModTime, err := xlMeta.ListVersions(volume, path)
+		versions, latestModTime, err := xlMeta.ListVersions(volume, path)
 		if err != nil {
 			return FileInfoVersions{}, err
 		}
@@ -34,7 +48,6 @@ func getFileInfoVersions(xlMetaBuf []byte, volume, path string) (FileInfoVersion
 			Volume:        volume,
 			Name:          path,
 			Versions:      versions,
-			Deleted:       deletedVersions,
 			LatestModTime: latestModTime,
 		}, nil
 	}
@@ -51,6 +64,7 @@ func getFileInfoVersions(xlMetaBuf []byte, volume, path string) (FileInfoVersion
 	}
 
 	fi.IsLatest = true // No versions so current version is latest.
+	fi.XLV1 = true     // indicates older version
 	return FileInfoVersions{
 		Volume:        volume,
 		Name:          path,
@@ -77,5 +91,6 @@ func getFileInfo(xlMetaBuf []byte, volume, path, versionID string) (FileInfo, er
 	if err == errFileNotFound && versionID != "" {
 		return fi, errFileVersionNotFound
 	}
+	fi.XLV1 = true // indicates older version
 	return fi, err
 }

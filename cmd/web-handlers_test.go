@@ -329,13 +329,23 @@ func testDeleteBucketWebHandler(obj ObjectLayer, instanceType string, t TestErrH
 		// Empty string = no error
 		expect string
 	}{
-		{"", false, token, "The specified bucket is not valid"},
+		{"", false, token, "Bucket Name  is invalid. Lowercase letters, period, " +
+			"hyphen, numerals are the only allowed characters and should be minimum " +
+			"3 characters in length."},
 		{".", false, "auth", "Authentication failed"},
-		{".", false, token, "The specified bucket is not valid"},
-		{"..", false, token, "The specified bucket is not valid"},
-		{"ab", false, token, "The specified bucket is not valid"},
+		{".", false, token, "Bucket Name . is invalid. Lowercase letters, period, " +
+			"hyphen, numerals are the only allowed characters and should be minimum " +
+			"3 characters in length."},
+		{"..", false, token, "Bucket Name .. is invalid. Lowercase letters, period, " +
+			"hyphen, numerals are the only allowed characters and should be minimum " +
+			"3 characters in length."},
+		{"ab", false, token, "Bucket Name ab is invalid. Lowercase letters, period, " +
+			"hyphen, numerals are the only allowed characters and should be minimum " +
+			"3 characters in length."},
 		{"minio", false, "false token", "Authentication failed"},
-		{"minio", false, token, "The specified bucket is not valid"},
+		{"minio", false, token, "Bucket Name minio is invalid. Lowercase letters, period, " +
+			"hyphen, numerals are the only allowed characters and should be minimum " +
+			"3 characters in length."},
 		{bucketName, false, token, ""},
 		{bucketName, true, token, "The bucket you tried to delete is not empty"},
 		{bucketName, false, "", "JWT token missing"},
@@ -742,7 +752,7 @@ func testUploadWebHandler(obj ObjectLayer, instanceType string, t TestErrHandler
 
 	test := func(token string, sendContentLength bool) int {
 		rec := httptest.NewRecorder()
-		req, rErr := http.NewRequest("PUT", "/minio/upload/"+bucketName+SlashSeparator+objectName, nil)
+		req, rErr := http.NewRequest(http.MethodPut, "/minio/upload/"+bucketName+SlashSeparator+objectName, nil)
 		if rErr != nil {
 			t.Fatalf("Cannot create upload request, %v", rErr)
 		}
@@ -828,7 +838,7 @@ func testDownloadWebHandler(obj ObjectLayer, instanceType string, t TestErrHandl
 			path = path + token
 		}
 		var req *http.Request
-		req, err = http.NewRequest("GET", path, nil)
+		req, err = http.NewRequest(http.MethodGet, path, nil)
 
 		if err != nil {
 			t.Fatalf("Cannot create upload request, %v", err)
@@ -947,7 +957,7 @@ func testWebHandlerDownloadZip(obj ObjectLayer, instanceType string, t TestErrHa
 			return 0, nil
 		}
 		var req *http.Request
-		req, err = http.NewRequest("POST", path, bytes.NewBuffer(argsData))
+		req, err = http.NewRequest(http.MethodPost, path, bytes.NewBuffer(argsData))
 
 		if err != nil {
 			t.Fatalf("Cannot create upload request, %v", err)
@@ -1045,7 +1055,7 @@ func testWebPresignedGetHandler(obj ObjectLayer, instanceType string, t TestErrH
 	// Initialize a new api recorder.
 	arec := httptest.NewRecorder()
 
-	req, err = newTestRequest("GET", presignGetRep.URL, 0, nil)
+	req, err = newTestRequest(http.MethodGet, presignGetRep.URL, 0, nil)
 	req.Header.Del("x-amz-content-sha256")
 	if err != nil {
 		t.Fatal("Failed to initialized a new request", err)
@@ -1143,7 +1153,7 @@ func TestWebCheckAuthorization(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	// Test authorization of Web.Download
-	req, err := http.NewRequest("GET", "/minio/download/bucket/object?token=wrongauth", nil)
+	req, err := http.NewRequest(http.MethodGet, "/minio/download/bucket/object?token=wrongauth", nil)
 	if err != nil {
 		t.Fatalf("Cannot create upload request, %v", err)
 	}
@@ -1160,7 +1170,7 @@ func TestWebCheckAuthorization(t *testing.T) {
 	rec = httptest.NewRecorder()
 	// Test authorization of Web.Upload
 	content := []byte("temporary file's content")
-	req, err = http.NewRequest("PUT", "/minio/upload/bucket/object", nil)
+	req, err = http.NewRequest(http.MethodPut, "/minio/upload/bucket/object", nil)
 	req.Header.Set("Authorization", "Bearer foo-authorization")
 	req.Header.Set("User-Agent", "Mozilla")
 	req.Header.Set("Content-Length", strconv.Itoa(len(content)))
@@ -1278,7 +1288,7 @@ func TestWebObjectLayerFaultyDisks(t *testing.T) {
 	}
 
 	// Test authorization of Web.Download
-	req, err = http.NewRequest("GET", "/minio/download/bucket/object?token="+authorization, nil)
+	req, err = http.NewRequest(http.MethodGet, "/minio/download/bucket/object?token="+authorization, nil)
 	if err != nil {
 		t.Fatalf("Cannot create upload request, %v", err)
 	}
@@ -1289,7 +1299,7 @@ func TestWebObjectLayerFaultyDisks(t *testing.T) {
 
 	// Test authorization of Web.Upload
 	content := []byte("temporary file's content")
-	req, err = http.NewRequest("PUT", "/minio/upload/bucket/object", nil)
+	req, err = http.NewRequest(http.MethodPut, "/minio/upload/bucket/object", nil)
 	req.Header.Set("Authorization", "Bearer "+authorization)
 	req.Header.Set("Content-Length", strconv.Itoa(len(content)))
 	req.Header.Set("x-amz-date", "20160814T114029Z")

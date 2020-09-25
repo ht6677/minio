@@ -106,7 +106,7 @@ func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
 	}
 	healMetricsNamespace := "self_heal"
 
-	dur := time.Duration(-1)
+	var dur time.Duration
 	if !bgSeq.lastHealActivity.IsZero() {
 		dur = time.Since(bgSeq.lastHealActivity)
 	}
@@ -157,7 +157,7 @@ func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
 // collects gateway specific metrics for MinIO instance in Prometheus specific format
 // and sends to given channel
 func gatewayMetricsPrometheus(ch chan<- prometheus.Metric) {
-	if !globalIsGateway || (globalGatewayName != "s3" && globalGatewayName != "azure" && globalGatewayName != "gcs") {
+	if !globalIsGateway || (globalGatewayName != S3BackendGateway && globalGatewayName != AzureBackendGateway && globalGatewayName != GCSBackendGateway) {
 		return
 	}
 
@@ -260,6 +260,27 @@ func cacheMetricsPrometheus(ch chan<- prometheus.Metric) {
 		prometheus.CounterValue,
 		float64(cacheObjLayer.CacheStats().getBytesServed()),
 	)
+	for _, cdStats := range cacheObjLayer.CacheStats().GetDiskStats() {
+		// Cache disk usage percentage
+		ch <- prometheus.MustNewConstMetric(
+			prometheus.NewDesc(
+				prometheus.BuildFQName("cache", "usage", "percent"),
+				"Total percentage cache usage",
+				[]string{"disk"}, nil),
+			prometheus.GaugeValue,
+			float64(cdStats.UsagePercent),
+			cdStats.Dir,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			prometheus.NewDesc(
+				prometheus.BuildFQName("cache", "usage", "high"),
+				"Indicates cache usage is high or low, relative to current cache 'quota' settings",
+				[]string{"disk"}, nil),
+			prometheus.GaugeValue,
+			float64(cdStats.UsageState),
+			cdStats.Dir,
+		)
+	}
 }
 
 // collects http metrics for MinIO server in Prometheus specific format
@@ -357,6 +378,10 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		return
 	}
 
+	if globalIsGateway {
+		return
+	}
+
 	// Crawler disabled, nothing to do.
 	if env.Get(envDataUsageCrawlConf, config.EnableOn) != config.EnableOn {
 		return
@@ -443,10 +468,7 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		float64(totalDisks.Sum()),
 	)
 
-	for i := 0; i < len(storageInfo.Total); i++ {
-		mountPath, total, free := storageInfo.MountPaths[i], storageInfo.Total[i],
-			storageInfo.Available[i]
-
+	for _, disk := range storageInfo.Disks {
 		// Total disk usage by the disk
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
@@ -454,8 +476,8 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 				"Total disk storage used on the disk",
 				[]string{"disk"}, nil),
 			prometheus.GaugeValue,
-			float64(total-free),
-			mountPath,
+			float64(disk.UsedSpace),
+			disk.DrivePath,
 		)
 
 		// Total available space in the disk
@@ -465,8 +487,8 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 				"Total available space left on the disk",
 				[]string{"disk"}, nil),
 			prometheus.GaugeValue,
-			float64(free),
-			mountPath,
+			float64(disk.AvailableSpace),
+			disk.DrivePath,
 		)
 
 		// Total storage space of the disk
@@ -476,8 +498,8 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 				"Total space on the disk",
 				[]string{"disk"}, nil),
 			prometheus.GaugeValue,
-			float64(total),
-			mountPath,
+			float64(disk.TotalSpace),
+			disk.DrivePath,
 		)
 	}
 }

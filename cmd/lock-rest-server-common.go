@@ -27,6 +27,7 @@ const (
 )
 
 const (
+	lockRESTMethodHealth  = "/health"
 	lockRESTMethodLock    = "/lock"
 	lockRESTMethodRLock   = "/rlock"
 	lockRESTMethodUnlock  = "/unlock"
@@ -41,6 +42,7 @@ const (
 )
 
 var (
-	errLockConflict   = errors.New("lock conflict")
-	errLockNotExpired = errors.New("lock not expired")
+	errLockConflict       = errors.New("lock conflict")
+	errLockNotExpired     = errors.New("lock not expired")
+	errLockNotInitialized = errors.New("lock not initialized")
 )

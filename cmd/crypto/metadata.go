@@ -19,6 +19,7 @@ import (
 	"encoding/base64"
 	"errors"
 
+	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 )
 
@@ -38,6 +39,8 @@ func IsMultiPart(metadata map[string]string) bool {
 func RemoveSensitiveEntries(metadata map[string]string) { // The functions is tested in TestRemoveSensitiveHeaders for compatibility reasons
 	delete(metadata, SSECKey)
 	delete(metadata, SSECopyKey)
+	delete(metadata, xhttp.AmzMetaUnencryptedContentLength)
+	delete(metadata, xhttp.AmzMetaUnencryptedContentMD5)
 }
 
 // RemoveSSEHeaders removes all crypto-specific SSE
@@ -60,6 +63,17 @@ func RemoveInternalEntries(metadata map[string]string) {
 	delete(metadata, S3SealedKey)
 	delete(metadata, S3KMSKeyID)
 	delete(metadata, S3KMSSealedKey)
+}
+
+// IsSourceEncrypted returns true if the source is encrypted
+func IsSourceEncrypted(metadata map[string]string) bool {
+	if _, ok := metadata[SSECAlgorithm]; ok {
+		return true
+	}
+	if _, ok := metadata[SSEHeader]; ok {
+		return true
+	}
+	return false
 }
 
 // IsEncrypted returns true if the object metadata indicates
@@ -115,7 +129,7 @@ func (ssec) IsEncrypted(metadata map[string]string) bool {
 // metadata is nil.
 func CreateMultipartMetadata(metadata map[string]string) map[string]string {
 	if metadata == nil {
-		metadata = map[string]string{}
+		return map[string]string{SSEMultipart: ""}
 	}
 	metadata[SSEMultipart] = ""
 	return metadata
@@ -142,7 +156,7 @@ func (s3) CreateMetadata(metadata map[string]string, keyID string, kmsKey []byte
 	}
 
 	if metadata == nil {
-		metadata = map[string]string{}
+		metadata = make(map[string]string, 5)
 	}
 
 	metadata[SSESealAlgorithm] = sealedKey.Algorithm
@@ -222,7 +236,7 @@ func (ssec) CreateMetadata(metadata map[string]string, sealedKey SealedKey) map[
 	}
 
 	if metadata == nil {
-		metadata = map[string]string{}
+		metadata = make(map[string]string, 3)
 	}
 	metadata[SSESealAlgorithm] = SealAlgorithm
 	metadata[SSEIV] = base64.StdEncoding.EncodeToString(sealedKey.IV[:])

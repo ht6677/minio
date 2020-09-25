@@ -29,7 +29,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zip"
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/cmd/crypto"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/bucket/policy"
@@ -58,7 +58,7 @@ func (sys *NotificationSys) GetARNList(onlyActive bool) []string {
 	}
 	region := globalServerRegion
 	for targetID, target := range sys.targetList.TargetMap() {
-		// httpclient target is part of ListenBucketNotification
+		// httpclient target is part of ListenNotification
 		// which doesn't need to be listed as part of the ARN list
 		// This list is only meant for external targets, filter
 		// this out pro-actively.
@@ -269,21 +269,26 @@ func (sys *NotificationSys) LoadServiceAccount(accessKey string) []NotificationP
 }
 
 // BackgroundHealStatus - returns background heal status of all peers
-func (sys *NotificationSys) BackgroundHealStatus() []madmin.BgHealState {
+func (sys *NotificationSys) BackgroundHealStatus() ([]madmin.BgHealState, []NotificationPeerErr) {
+	ng := WithNPeers(len(sys.peerClients))
 	states := make([]madmin.BgHealState, len(sys.peerClients))
 	for idx, client := range sys.peerClients {
 		if client == nil {
 			continue
 		}
-		st, err := client.BackgroundHealStatus()
-		if err != nil {
-			logger.LogIf(GlobalContext, err)
-		} else {
+		idx := idx
+		client := client
+		ng.Go(GlobalContext, func() error {
+			st, err := client.BackgroundHealStatus()
+			if err != nil {
+				return err
+			}
 			states[idx] = st
-		}
+			return nil
+		}, idx, *client.host)
 	}
 
-	return states
+	return states, ng.Wait()
 }
 
 // StartProfiling - start profiling on remote peers, by initiating a remote RPC.
@@ -401,15 +406,15 @@ func (sys *NotificationSys) DownloadProfilingData(ctx context.Context, writer io
 }
 
 // ServerUpdate - updates remote peers.
-func (sys *NotificationSys) ServerUpdate(updateURL, sha256Hex string, latestReleaseTime time.Time) []NotificationPeerErr {
+func (sys *NotificationSys) ServerUpdate(ctx context.Context, u *url.URL, sha256Sum []byte, lrTime time.Time) []NotificationPeerErr {
 	ng := WithNPeers(len(sys.peerClients))
 	for idx, client := range sys.peerClients {
 		if client == nil {
 			continue
 		}
 		client := client
-		ng.Go(GlobalContext, func() error {
-			return client.ServerUpdate(updateURL, sha256Hex, latestReleaseTime)
+		ng.Go(ctx, func() error {
+			return client.ServerUpdate(ctx, u, sha256Sum, lrTime)
 		}, idx, *client.host)
 	}
 	return ng.Wait()
@@ -583,31 +588,6 @@ func (sys *NotificationSys) DeleteBucketMetadata(ctx context.Context, bucketName
 	}
 }
 
-// AddRemoteTarget - adds event rules map, HTTP/PeerRPC client target to bucket name.
-func (sys *NotificationSys) AddRemoteTarget(bucketName string, target event.Target, rulesMap event.RulesMap) error {
-	if err := sys.targetList.Add(target); err != nil {
-		return err
-	}
-
-	sys.Lock()
-	targetMap := sys.bucketRemoteTargetRulesMap[bucketName]
-	if targetMap == nil {
-		targetMap = make(map[event.TargetID]event.RulesMap)
-	}
-
-	rulesMap = rulesMap.Clone()
-	targetMap[target.ID()] = rulesMap
-	sys.bucketRemoteTargetRulesMap[bucketName] = targetMap
-
-	rulesMap = rulesMap.Clone()
-	rulesMap.Add(sys.bucketRulesMap[bucketName])
-	sys.bucketRulesMap[bucketName] = rulesMap
-
-	sys.Unlock()
-
-	return nil
-}
-
 // Loads notification policies for all buckets into NotificationSys.
 func (sys *NotificationSys) load(buckets []BucketInfo, objAPI ObjectLayer) error {
 	for _, bucket := range buckets {
@@ -629,7 +609,7 @@ func (sys *NotificationSys) load(buckets []BucketInfo, objAPI ObjectLayer) error
 }
 
 // Init - initializes notification system from notification.xml and listenxl.meta of all buckets.
-func (sys *NotificationSys) Init(buckets []BucketInfo, objAPI ObjectLayer) error {
+func (sys *NotificationSys) Init(ctx context.Context, buckets []BucketInfo, objAPI ObjectLayer) error {
 	if objAPI == nil {
 		return errServerNotInitialized
 	}
@@ -652,13 +632,13 @@ func (sys *NotificationSys) Init(buckets []BucketInfo, objAPI ObjectLayer) error
 			if res.Err != nil {
 				reqInfo := &logger.ReqInfo{}
 				reqInfo.AppendTags("targetID", res.ID.Name)
-				ctx := logger.SetReqInfo(GlobalContext, reqInfo)
-				logger.LogOnceIf(ctx, res.Err, res.ID)
+				logger.LogOnceIf(logger.SetReqInfo(GlobalContext, reqInfo), res.Err, res.ID)
 			}
 		}
 	}()
 
-	return sys.load(buckets, objAPI)
+	go logger.LogIf(ctx, sys.load(buckets, objAPI))
+	return nil
 }
 
 // AddRulesMap - adds rules map for bucket name.
@@ -1138,6 +1118,36 @@ func (sys *NotificationSys) ProcOBDInfo(ctx context.Context) []madmin.ServerProc
 	return reply
 }
 
+// LogOBDInfo - Logs OBD information
+func (sys *NotificationSys) LogOBDInfo(ctx context.Context) []madmin.ServerLogOBDInfo {
+	reply := make([]madmin.ServerLogOBDInfo, len(sys.peerClients))
+
+	g := errgroup.WithNErrs(len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		index := index
+		g.Go(func() error {
+			var err error
+			reply[index], err = sys.peerClients[index].LogOBDInfo(ctx)
+			return err
+		}, index)
+	}
+
+	for index, err := range g.Wait() {
+		if err != nil {
+			addr := sys.peerClients[index].host.String()
+			reqInfo := (&logger.ReqInfo{}).AppendTags("remotePeer", addr)
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+			logger.LogIf(ctx, err)
+			reply[index].Addr = addr
+			reply[index].Error = err.Error()
+		}
+	}
+	return reply
+}
+
 // ServerInfo - calls ServerInfo RPC call on all peers.
 func (sys *NotificationSys) ServerInfo() []madmin.ServerProperties {
 	reply := make([]madmin.ServerProperties, len(sys.peerClients))
@@ -1164,31 +1174,26 @@ func (sys *NotificationSys) ServerInfo() []madmin.ServerProperties {
 }
 
 // GetLocalDiskIDs - return disk ids of the local disks of the peers.
-func (sys *NotificationSys) GetLocalDiskIDs(ctx context.Context) []string {
-	var diskIDs []string
-	var mu sync.Mutex
-
+func (sys *NotificationSys) GetLocalDiskIDs(ctx context.Context) (localDiskIDs [][]string) {
+	localDiskIDs = make([][]string, len(sys.peerClients))
 	var wg sync.WaitGroup
-	for _, client := range sys.peerClients {
+	for idx, client := range sys.peerClients {
 		if client == nil {
 			continue
 		}
 		wg.Add(1)
-		go func(client *peerRESTClient) {
+		go func(idx int, client *peerRESTClient) {
 			defer wg.Done()
-			ids := client.GetLocalDiskIDs(ctx)
-			mu.Lock()
-			diskIDs = append(diskIDs, ids...)
-			mu.Unlock()
-		}(client)
+			localDiskIDs[idx] = client.GetLocalDiskIDs(ctx)
+		}(idx, client)
 	}
 	wg.Wait()
-	return diskIDs
+	return localDiskIDs
 }
 
 // NewNotificationSys - creates new notification system object.
 func NewNotificationSys(endpoints EndpointZones) *NotificationSys {
-	// bucketRulesMap/bucketRemoteTargetRulesMap are initialized by NotificationSys.Init()
+	// targetList/bucketRulesMap/bucketRemoteTargetRulesMap are populated by NotificationSys.Init()
 	return &NotificationSys{
 		targetList:                 event.NewTargetList(),
 		targetResCh:                make(chan event.TargetIDResult),
@@ -1257,7 +1262,7 @@ func (args eventArgs) ToEvent(escape bool) event.Event {
 		},
 	}
 
-	if args.EventName != event.ObjectRemovedDelete {
+	if args.EventName != event.ObjectRemovedDelete && args.EventName != event.ObjectRemovedDeleteMarkerCreated {
 		newEvent.S3.Object.ETag = args.Object.ETag
 		newEvent.S3.Object.Size = args.Object.Size
 		newEvent.S3.Object.ContentType = args.Object.ContentType

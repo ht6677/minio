@@ -17,15 +17,42 @@
 package cmd
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gorilla/mux"
-	"github.com/minio/minio/cmd/crypto"
 	"github.com/minio/minio/cmd/logger"
 
 	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/sync/errgroup"
 )
+
+func concurrentDecryptETag(ctx context.Context, objects []ObjectInfo) {
+	inParallel := func(objects []ObjectInfo) {
+		g := errgroup.WithNErrs(len(objects))
+		for index := range objects {
+			index := index
+			g.Go(func() error {
+				objects[index].ETag = objects[index].GetActualETag(nil)
+				objects[index].Size, _ = objects[index].GetActualSize()
+				return nil
+			}, index)
+		}
+		g.Wait()
+	}
+	const maxConcurrent = 500
+	for {
+		if len(objects) < maxConcurrent {
+			inParallel(objects)
+			return
+		}
+		inParallel(objects[:maxConcurrent])
+		objects = objects[maxConcurrent:]
+	}
+}
 
 // Validate all the ListObjects query arguments, returns an APIErrorCode
 // if one of the args do not meet the required conditions.
@@ -66,7 +93,7 @@ func (api objectAPIHandlers) ListObjectVersionsHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.ListBucketAction, bucket, ""); s3Error != ErrNone {
+	if s3Error := checkRequestAuthType(ctx, r, policy.ListBucketVersionsAction, bucket, ""); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
 		return
 	}
@@ -86,6 +113,10 @@ func (api objectAPIHandlers) ListObjectVersionsHandler(w http.ResponseWriter, r 
 		return
 	}
 
+	if proxyRequestByBucket(ctx, w, r, bucket) {
+		return
+	}
+
 	listObjectVersions := objectAPI.ListObjectVersions
 
 	// Inititate a list object versions operation based on the input params.
@@ -97,16 +128,7 @@ func (api objectAPIHandlers) ListObjectVersionsHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	for i := range listObjectVersionsInfo.Objects {
-		if crypto.IsEncrypted(listObjectVersionsInfo.Objects[i].UserDefined) {
-			listObjectVersionsInfo.Objects[i].ETag = getDecryptedETag(r.Header, listObjectVersionsInfo.Objects[i], false)
-		}
-		listObjectVersionsInfo.Objects[i].Size, err = listObjectVersionsInfo.Objects[i].GetActualSize()
-		if err != nil {
-			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
-			return
-		}
-	}
+	concurrentDecryptETag(ctx, listObjectVersionsInfo.Objects)
 
 	response := generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delimiter, encodingType, maxkeys, listObjectVersionsInfo)
 
@@ -157,6 +179,13 @@ func (api objectAPIHandlers) ListObjectsV2MHandler(w http.ResponseWriter, r *htt
 		return
 	}
 
+	// Analyze continuation token and route the request accordingly
+	var success bool
+	token, success = proxyRequestByToken(ctx, w, r, token)
+	if success {
+		return
+	}
+
 	listObjectsV2 := objectAPI.ListObjectsV2
 
 	// Inititate a list objects operation based on the input params.
@@ -168,19 +197,15 @@ func (api objectAPIHandlers) ListObjectsV2MHandler(w http.ResponseWriter, r *htt
 		return
 	}
 
-	for i := range listObjectsV2Info.Objects {
-		if crypto.IsEncrypted(listObjectsV2Info.Objects[i].UserDefined) {
-			listObjectsV2Info.Objects[i].ETag = getDecryptedETag(r.Header, listObjectsV2Info.Objects[i], false)
-		}
-		listObjectsV2Info.Objects[i].Size, err = listObjectsV2Info.Objects[i].GetActualSize()
-		if err != nil {
-			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
-			return
-		}
+	concurrentDecryptETag(ctx, listObjectsV2Info.Objects)
+
+	// The next continuation token has id@node_index format to optimize paginated listing
+	nextContinuationToken := listObjectsV2Info.NextContinuationToken
+	if nextContinuationToken != "" && listObjectsV2Info.IsTruncated {
+		nextContinuationToken = fmt.Sprintf("%s@%d", listObjectsV2Info.NextContinuationToken, getLocalNodeIndex())
 	}
 
-	response := generateListObjectsV2Response(bucket, prefix, token,
-		listObjectsV2Info.NextContinuationToken, startAfter,
+	response := generateListObjectsV2Response(bucket, prefix, token, nextContinuationToken, startAfter,
 		delimiter, encodingType, fetchOwner, listObjectsV2Info.IsTruncated,
 		maxKeys, listObjectsV2Info.Objects, listObjectsV2Info.Prefixes, true)
 
@@ -231,6 +256,13 @@ func (api objectAPIHandlers) ListObjectsV2Handler(w http.ResponseWriter, r *http
 		return
 	}
 
+	// Analyze continuation token and route the request accordingly
+	var success bool
+	token, success = proxyRequestByToken(ctx, w, r, token)
+	if success {
+		return
+	}
+
 	listObjectsV2 := objectAPI.ListObjectsV2
 
 	// Inititate a list objects operation based on the input params.
@@ -242,24 +274,74 @@ func (api objectAPIHandlers) ListObjectsV2Handler(w http.ResponseWriter, r *http
 		return
 	}
 
-	for i := range listObjectsV2Info.Objects {
-		if crypto.IsEncrypted(listObjectsV2Info.Objects[i].UserDefined) {
-			listObjectsV2Info.Objects[i].ETag = getDecryptedETag(r.Header, listObjectsV2Info.Objects[i], false)
-		}
-		listObjectsV2Info.Objects[i].Size, err = listObjectsV2Info.Objects[i].GetActualSize()
-		if err != nil {
-			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
-			return
-		}
+	concurrentDecryptETag(ctx, listObjectsV2Info.Objects)
+
+	// The next continuation token has id@node_index format to optimize paginated listing
+	nextContinuationToken := listObjectsV2Info.NextContinuationToken
+	if nextContinuationToken != "" && listObjectsV2Info.IsTruncated {
+		nextContinuationToken = fmt.Sprintf("%s@%d", listObjectsV2Info.NextContinuationToken, getLocalNodeIndex())
 	}
 
-	response := generateListObjectsV2Response(bucket, prefix, token,
-		listObjectsV2Info.NextContinuationToken, startAfter,
+	response := generateListObjectsV2Response(bucket, prefix, token, nextContinuationToken, startAfter,
 		delimiter, encodingType, fetchOwner, listObjectsV2Info.IsTruncated,
 		maxKeys, listObjectsV2Info.Objects, listObjectsV2Info.Prefixes, false)
 
 	// Write success response.
 	writeSuccessResponseXML(w, encodeResponse(response))
+}
+
+func getLocalNodeIndex() int {
+	if len(globalProxyEndpoints) == 0 {
+		return -1
+	}
+	for i, ep := range globalProxyEndpoints {
+		if ep.IsLocal {
+			return i
+		}
+	}
+	return -1
+}
+
+func parseRequestToken(token string) (subToken string, nodeIndex int) {
+	if token == "" {
+		return token, -1
+	}
+	i := strings.Index(token, "@")
+	if i < 0 {
+		return token, -1
+	}
+	nodeIndex, err := strconv.Atoi(token[i+1:])
+	if err != nil {
+		return token, -1
+	}
+	subToken = token[:i]
+	return subToken, nodeIndex
+}
+
+func proxyRequestByToken(ctx context.Context, w http.ResponseWriter, r *http.Request, token string) (string, bool) {
+	subToken, nodeIndex := parseRequestToken(token)
+	if nodeIndex > 0 {
+		return subToken, proxyRequestByNodeIndex(ctx, w, r, nodeIndex)
+	}
+	return subToken, false
+}
+
+func proxyRequestByNodeIndex(ctx context.Context, w http.ResponseWriter, r *http.Request, index int) (success bool) {
+	if len(globalProxyEndpoints) == 0 {
+		return false
+	}
+	if index < 0 || index >= len(globalProxyEndpoints) {
+		return false
+	}
+	ep := globalProxyEndpoints[index]
+	if ep.IsLocal {
+		return false
+	}
+	return proxyRequest(ctx, w, r, ep)
+}
+
+func proxyRequestByBucket(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket string) (success bool) {
+	return proxyRequestByNodeIndex(ctx, w, r, crcHashMod(bucket, len(globalProxyEndpoints)))
 }
 
 // ListObjectsV1Handler - GET Bucket (List Objects) Version 1.
@@ -300,6 +382,10 @@ func (api objectAPIHandlers) ListObjectsV1Handler(w http.ResponseWriter, r *http
 		return
 	}
 
+	if proxyRequestByBucket(ctx, w, r, bucket) {
+		return
+	}
+
 	listObjects := objectAPI.ListObjects
 
 	// Inititate a list objects operation based on the input params.
@@ -311,16 +397,7 @@ func (api objectAPIHandlers) ListObjectsV1Handler(w http.ResponseWriter, r *http
 		return
 	}
 
-	for i := range listObjectsInfo.Objects {
-		if crypto.IsEncrypted(listObjectsInfo.Objects[i].UserDefined) {
-			listObjectsInfo.Objects[i].ETag = getDecryptedETag(r.Header, listObjectsInfo.Objects[i], false)
-		}
-		listObjectsInfo.Objects[i].Size, err = listObjectsInfo.Objects[i].GetActualSize()
-		if err != nil {
-			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
-			return
-		}
-	}
+	concurrentDecryptETag(ctx, listObjectsInfo.Objects)
 
 	response := generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingType, maxKeys, listObjectsInfo)
 

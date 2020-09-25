@@ -17,20 +17,24 @@
 package cmd
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"path"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/cmd/rest"
 	"github.com/minio/minio/pkg/env"
 	"github.com/minio/minio/pkg/mountinfo"
 )
@@ -44,9 +48,14 @@ const (
 
 	// URLEndpointType - URL style endpoint type enum.
 	URLEndpointType
-
-	retryInterval = 5 // In Seconds.
 )
+
+// ProxyEndpoint - endpoint used for proxy redirects
+// See proxyRequest() for details.
+type ProxyEndpoint struct {
+	Endpoint
+	Transport *http.Transport
+}
 
 // Endpoint - any type of endpoint.
 type Endpoint struct {
@@ -185,7 +194,7 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 }
 
 // ZoneEndpoints represent endpoints in a given zone
-// along with its setCount and drivesPerSet.
+// along with its setCount and setDriveCount.
 type ZoneEndpoints struct {
 	SetCount     int
 	DrivesPerSet int
@@ -194,6 +203,21 @@ type ZoneEndpoints struct {
 
 // EndpointZones - list of list of endpoints
 type EndpointZones []ZoneEndpoints
+
+// GetLocalZoneIdx returns the zone which endpoint belongs to locally.
+// if ep is remote this code will return -1 zoneIndex
+func (l EndpointZones) GetLocalZoneIdx(ep Endpoint) int {
+	for i, zep := range l {
+		for _, cep := range zep.Endpoints {
+			if cep.IsLocal && ep.IsLocal {
+				if reflect.DeepEqual(cep, ep) {
+					return i
+				}
+			}
+		}
+	}
+	return -1
+}
 
 // Add add zone endpoints
 func (l *EndpointZones) Add(zeps ZoneEndpoints) error {
@@ -231,15 +255,15 @@ func (l EndpointZones) NEndpoints() (count int) {
 	return count
 }
 
-// Hosts - returns list of unique hosts
-func (l EndpointZones) Hosts() []string {
+// Hostnames - returns list of unique hostnames
+func (l EndpointZones) Hostnames() []string {
 	foundSet := set.NewStringSet()
 	for _, ep := range l {
 		for _, endpoint := range ep.Endpoints {
-			if foundSet.Contains(endpoint.Host) {
+			if foundSet.Contains(endpoint.Hostname()) {
 				continue
 			}
-			foundSet.Add(endpoint.Host)
+			foundSet.Add(endpoint.Hostname())
 		}
 	}
 	return foundSet.ToSlice()
@@ -302,7 +326,7 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 	resolvedList := make([]bool, len(endpoints))
 	// Mark the starting time
 	startTime := time.Now()
-	keepAliveTicker := time.NewTicker(retryInterval * time.Second)
+	keepAliveTicker := time.NewTicker(10 * time.Millisecond)
 	defer keepAliveTicker.Stop()
 	for {
 		// Break if the local endpoint is found already Or all the endpoints are resolved.
@@ -708,6 +732,57 @@ func GetRemotePeers(endpointZones EndpointZones) []string {
 		}
 	}
 	return peerSet.ToSlice()
+}
+
+// GetProxyEndpointLocalIndex returns index of the local proxy endpoint
+func GetProxyEndpointLocalIndex(proxyEps []ProxyEndpoint) int {
+	for i, pep := range proxyEps {
+		if pep.IsLocal {
+			return i
+		}
+	}
+	return -1
+}
+
+// GetProxyEndpoints - get all endpoints that can be used to proxy list request.
+func GetProxyEndpoints(endpointZones EndpointZones) ([]ProxyEndpoint, error) {
+	var proxyEps []ProxyEndpoint
+
+	proxyEpSet := set.NewStringSet()
+
+	for _, ep := range endpointZones {
+		for _, endpoint := range ep.Endpoints {
+			if endpoint.Type() != URLEndpointType {
+				continue
+			}
+
+			host := endpoint.Host
+			if proxyEpSet.Contains(host) {
+				continue
+			}
+			proxyEpSet.Add(host)
+
+			var tlsConfig *tls.Config
+			if globalIsSSL {
+				tlsConfig = &tls.Config{
+					ServerName: endpoint.Hostname(),
+					RootCAs:    globalRootCAs,
+				}
+			}
+
+			tr := newCustomHTTPTransport(tlsConfig, rest.DefaultRESTTimeout)()
+			// Allow more requests to be in flight with higher response header timeout.
+			tr.ResponseHeaderTimeout = 30 * time.Minute
+			tr.MaxIdleConns = 64
+			tr.MaxIdleConnsPerHost = 64
+
+			proxyEps = append(proxyEps, ProxyEndpoint{
+				Endpoint:  endpoint,
+				Transport: tr,
+			})
+		}
+	}
+	return proxyEps, nil
 }
 
 func updateDomainIPs(endPoints set.StringSet) {

@@ -96,6 +96,12 @@ var (
 		"MINIO_CACHE_ENCRYPTION_MASTER_KEY: For more information, please refer to https://docs.min.io/docs/minio-disk-cache-guide",
 	)
 
+	ErrInvalidCacheRange = newErrFn(
+		"Invalid cache range value",
+		"Please check the passed value",
+		"MINIO_CACHE_RANGE: Valid expected value is `on` or `off`",
+	)
+
 	ErrInvalidRotatingCredentialsBackendEncrypted = newErrFn(
 		"Invalid rotating credentials",
 		"Please set correct rotating credentials in the environment for decryption",
@@ -178,12 +184,6 @@ Example 1:
 	ErrUnsupportedBackend = newErrFn(
 		"Unable to write to the backend",
 		"Please ensure your disk supports O_DIRECT",
-		"",
-	)
-
-	ErrCorruptedBackend = newErrFn(
-		"Unable to use the specified backend, pre-existing content detected",
-		"Please ensure your disk mount does not have any pre-existing content",
 		"",
 	)
 

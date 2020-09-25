@@ -24,9 +24,10 @@ import (
 )
 
 var (
-	errLifecycleTooManyRules      = Errorf("Lifecycle configuration allows a maximum of 1000 rules")
-	errLifecycleNoRule            = Errorf("Lifecycle configuration should have at least one rule")
-	errLifecycleOverlappingPrefix = Errorf("Lifecycle configuration has rules with overlapping prefix")
+	errLifecycleTooManyRules = Errorf("Lifecycle configuration allows a maximum of 1000 rules")
+	errLifecycleNoRule       = Errorf("Lifecycle configuration should have at least one rule")
+	errLifecycleDuplicateID  = Errorf("Lifecycle configuration has rule with the same ID. Rule ID must be unique.")
+	errXMLNotWellFormed      = Errorf("The XML you provided was not well-formed or did not validate against our published schema")
 )
 
 // Action represents a delete action or other transition
@@ -40,6 +41,8 @@ const (
 	NoneAction Action = iota
 	// DeleteAction means the object needs to be removed after evaluting lifecycle rules
 	DeleteAction
+	// DeleteVersionAction deletes a particular version
+	DeleteVersionAction
 )
 
 // Lifecycle - Configuration for bucket lifecycle.
@@ -60,14 +63,19 @@ func (lc Lifecycle) HasActiveRules(prefix string, recursive bool) bool {
 		if rule.Status == Disabled {
 			continue
 		}
+
 		if len(prefix) > 0 && len(rule.Filter.Prefix) > 0 {
-			// incoming prefix must be in rule prefix
-			if !recursive && !strings.HasPrefix(prefix, rule.Filter.Prefix) {
-				continue
+			if !recursive {
+				// If not recursive, incoming prefix must be in rule prefix
+				if !strings.HasPrefix(prefix, rule.Filter.Prefix) {
+					continue
+				}
 			}
-			// If recursive, we can skip this rule if it doesn't match the tested prefix.
-			if recursive && !strings.HasPrefix(rule.Filter.Prefix, prefix) {
-				continue
+			if recursive {
+				// If recursive, we can skip this rule if it doesn't match the tested prefix.
+				if !strings.HasPrefix(prefix, rule.Filter.Prefix) && !strings.HasPrefix(rule.Filter.Prefix, prefix) {
+					continue
+				}
 			}
 		}
 
@@ -113,17 +121,15 @@ func (lc Lifecycle) Validate() error {
 			return err
 		}
 	}
-	// Compare every rule's prefix with every other rule's prefix
+	// Make sure Rule ID is unique
 	for i := range lc.Rules {
 		if i == len(lc.Rules)-1 {
 			break
 		}
-		// N B Empty prefixes overlap with all prefixes
 		otherRules := lc.Rules[i+1:]
 		for _, otherRule := range otherRules {
-			if strings.HasPrefix(lc.Rules[i].Prefix(), otherRule.Prefix()) ||
-				strings.HasPrefix(otherRule.Prefix(), lc.Rules[i].Prefix()) {
-				return errLifecycleOverlappingPrefix
+			if lc.Rules[i].ID == otherRule.ID {
+				return errLifecycleDuplicateID
 			}
 		}
 	}
@@ -149,7 +155,7 @@ func (lc Lifecycle) FilterActionableRules(obj ObjectOpts) []Rule {
 		// be expired; if set to false the policy takes no action. This
 		// cannot be specified with Days or Date in a Lifecycle
 		// Expiration Policy.
-		if rule.Expiration.DeleteMarker {
+		if rule.Expiration.DeleteMarker.val {
 			rules = append(rules, rule)
 			continue
 		}
@@ -170,12 +176,14 @@ func (lc Lifecycle) FilterActionableRules(obj ObjectOpts) []Rule {
 // ObjectOpts provides information to deduce the lifecycle actions
 // which can be triggered on the resultant object.
 type ObjectOpts struct {
-	Name         string
-	UserTags     string
-	ModTime      time.Time
-	VersionID    string
-	IsLatest     bool
-	DeleteMarker bool
+	Name             string
+	UserTags         string
+	ModTime          time.Time
+	VersionID        string
+	IsLatest         bool
+	DeleteMarker     bool
+	NumVersions      int
+	SuccessorModTime time.Time
 }
 
 // ComputeAction returns the action to perform by evaluating all lifecycle rules
@@ -187,27 +195,26 @@ func (lc Lifecycle) ComputeAction(obj ObjectOpts) Action {
 	}
 
 	for _, rule := range lc.FilterActionableRules(obj) {
-		if obj.DeleteMarker && obj.IsLatest && bool(rule.Expiration.DeleteMarker) {
+		if obj.DeleteMarker && obj.NumVersions == 1 && rule.Expiration.DeleteMarker.val {
 			// Indicates whether MinIO will remove a delete marker with no noncurrent versions.
 			// Only latest marker is removed. If set to true, the delete marker will be expired;
 			// if set to false the policy takes no action. This cannot be specified with Days or
 			// Date in a Lifecycle Expiration Policy.
-			return DeleteAction
+			return DeleteVersionAction
 		}
 
 		if !rule.NoncurrentVersionExpiration.IsDaysNull() {
-			if obj.VersionID != "" && !obj.IsLatest {
-				// Non current versions should be deleted.
-				if time.Now().After(expectedExpiryTime(obj.ModTime, rule.NoncurrentVersionExpiration.NoncurrentDays)) {
-					return DeleteAction
+			if obj.VersionID != "" && !obj.IsLatest && !obj.SuccessorModTime.IsZero() {
+				// Non current versions should be deleted if their age exceeds non current days configuration
+				// https://docs.aws.amazon.com/AmazonS3/latest/dev/intro-lifecycle-rules.html#intro-lifecycle-rules-actions
+				if time.Now().After(expectedExpiryTime(obj.SuccessorModTime, rule.NoncurrentVersionExpiration.NoncurrentDays)) {
+					return DeleteVersionAction
 				}
-				return NoneAction
 			}
-			return NoneAction
 		}
 
-		// All other expiration only applies to latest versions.
-		if obj.IsLatest {
+		// Remove the object or simply add a delete marker (once) in a versioned bucket
+		if obj.VersionID == "" || obj.IsLatest && !obj.DeleteMarker {
 			switch {
 			case !rule.Expiration.IsDateNull():
 				if time.Now().UTC().After(rule.Expiration.Date.Time) {
@@ -220,6 +227,7 @@ func (lc Lifecycle) ComputeAction(obj ObjectOpts) Action {
 			}
 		}
 	}
+
 	return action
 }
 

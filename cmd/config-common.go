@@ -21,7 +21,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/hash"
 )
 
@@ -36,8 +35,6 @@ func readConfig(ctx context.Context, objAPI ObjectLayer, configFile string) ([]b
 			return nil, errConfigNotFound
 		}
 
-		logger.GetReqInfo(ctx).AppendTags("configFile", configFile)
-		logger.LogIf(ctx, err)
 		return nil, err
 	}
 
@@ -49,7 +46,11 @@ func readConfig(ctx context.Context, objAPI ObjectLayer, configFile string) ([]b
 	return buffer.Bytes(), nil
 }
 
-func deleteConfig(ctx context.Context, objAPI ObjectLayer, configFile string) error {
+type objectDeleter interface {
+	DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error)
+}
+
+func deleteConfig(ctx context.Context, objAPI objectDeleter, configFile string) error {
 	_, err := objAPI.DeleteObject(ctx, minioMetaBucket, configFile, ObjectOptions{})
 	if err != nil && isErrObjectNotFound(err) {
 		return errConfigNotFound
@@ -74,8 +75,6 @@ func checkConfig(ctx context.Context, objAPI ObjectLayer, configFile string) err
 			return errConfigNotFound
 		}
 
-		logger.GetReqInfo(ctx).AppendTags("configFile", configFile)
-		logger.LogIf(ctx, err)
 		return err
 	}
 	return nil

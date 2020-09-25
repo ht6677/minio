@@ -102,7 +102,7 @@ func (c *cacheControl) isStale(modTime time.Time) bool {
 func cacheControlOpts(o ObjectInfo) *cacheControl {
 	c := cacheControl{}
 	m := o.UserDefined
-	if o.Expires != timeSentinel {
+	if !o.Expires.Equal(timeSentinel) {
 		c.expiry = o.Expires
 	}
 
@@ -295,6 +295,7 @@ type fileScorer struct {
 	// The list is kept sorted according to score, highest at top, lowest at bottom.
 	queue       list.List
 	queuedBytes uint64
+	seenBytes   uint64
 }
 
 type queuedFile struct {
@@ -337,6 +338,7 @@ func (f *fileScorer) addFileWithObjInfo(objInfo ObjectInfo, hits int) {
 		versionID: objInfo.VersionID,
 		size:      uint64(objInfo.Size),
 	}
+	f.seenBytes += uint64(objInfo.Size)
 
 	var score float64
 	if objInfo.ModTime.IsZero() {
@@ -369,9 +371,14 @@ func (f *fileScorer) addFileWithObjInfo(objInfo ObjectInfo, hits int) {
 
 // adjustSaveBytes allows to adjust the number of bytes to save.
 // This can be used to adjust the count on the fly.
-// Returns true if there still is a need to delete files (saveBytes >0),
+// Returns true if there still is a need to delete files (n+saveBytes >0),
 // false if no more bytes needs to be saved.
 func (f *fileScorer) adjustSaveBytes(n int64) bool {
+	if int64(f.saveBytes)+n <= 0 {
+		f.saveBytes = 0
+		f.trimQueue()
+		return false
+	}
 	if n < 0 {
 		f.saveBytes -= ^uint64(n - 1)
 	} else {
@@ -439,6 +446,14 @@ func (f *fileScorer) fileObjInfos() []ObjectInfo {
 	return res
 }
 
+func (f *fileScorer) purgeFunc(p func(qfile queuedFile)) {
+	e := f.queue.Front()
+	for e != nil {
+		p(e.Value.(queuedFile))
+		e = e.Next()
+	}
+}
+
 // fileNames returns all queued file names.
 func (f *fileScorer) fileNames() []string {
 	res := make([]string, 0, f.queue.Len())
@@ -474,9 +489,15 @@ func (f *fileScorer) queueString() string {
 // bytesToClear() returns the number of bytes to clear to reach low watermark
 // w.r.t quota given disk total and free space, quota in % allocated to cache
 // and low watermark % w.r.t allowed quota.
-func bytesToClear(total, free int64, quotaPct, lowWatermark uint64) uint64 {
-	used := (total - free)
+// If the high watermark hasn't been reached 0 will be returned.
+func bytesToClear(total, free int64, quotaPct, lowWatermark, highWatermark uint64) uint64 {
+	used := total - free
 	quotaAllowed := total * (int64)(quotaPct) / 100
-	lowWMUsage := (total * (int64)(lowWatermark*quotaPct) / (100 * 100))
+	highWMUsage := total * (int64)(highWatermark*quotaPct) / (100 * 100)
+	if used < highWMUsage {
+		return 0
+	}
+	// Return bytes needed to reach low watermark.
+	lowWMUsage := total * (int64)(lowWatermark*quotaPct) / (100 * 100)
 	return (uint64)(math.Min(float64(quotaAllowed), math.Max(0.0, float64(used-lowWMUsage))))
 }

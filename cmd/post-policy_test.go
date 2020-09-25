@@ -196,7 +196,7 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 		{
 			objectName:         "test",
 			data:               []byte("Hello, World"),
-			expectedRespStatus: http.StatusBadRequest,
+			expectedRespStatus: http.StatusForbidden,
 			accessKey:          "",
 			secretKey:          "",
 			malformedBody:      false,
@@ -293,7 +293,7 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 		{
 			objectName:         "test",
 			data:               []byte("Hello, World"),
-			expectedRespStatus: http.StatusBadRequest,
+			expectedRespStatus: http.StatusForbidden,
 			accessKey:          "",
 			secretKey:          "",
 			dates:              []interface{}{},
@@ -548,7 +548,7 @@ func newPostRequestV2(endPoint, bucketName, objectName string, accessKey, secret
 	// Set the body equal to the created policy.
 	reader := bytes.NewReader(buf.Bytes())
 
-	req, err := http.NewRequest("POST", makeTestTargetURL(endPoint, bucketName, "", nil), reader)
+	req, err := http.NewRequest(http.MethodPost, makeTestTargetURL(endPoint, bucketName, "", nil), reader)
 	if err != nil {
 		return nil, err
 	}
@@ -626,7 +626,7 @@ func newPostRequestV4Generic(endPoint, bucketName, objectName string, objData []
 	// Set the body equal to the created policy.
 	reader := bytes.NewReader(buf.Bytes())
 
-	req, err := http.NewRequest("POST", makeTestTargetURL(endPoint, bucketName, "", nil), reader)
+	req, err := http.NewRequest(http.MethodPost, makeTestTargetURL(endPoint, bucketName, "", nil), reader)
 	if err != nil {
 		return nil, err
 	}

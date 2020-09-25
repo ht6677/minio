@@ -24,7 +24,7 @@ import (
 var (
 	errLifecycleInvalidDate         = Errorf("Date must be provided in ISO 8601 format")
 	errLifecycleInvalidDays         = Errorf("Days must be positive integer when used with Expiration")
-	errLifecycleInvalidExpiration   = Errorf("At least one of Days or Date should be present inside Expiration")
+	errLifecycleInvalidExpiration   = Errorf("Exactly one of Days (positive integer) or Date (positive ISO 8601 format) should be present inside Expiration.")
 	errLifecycleInvalidDeleteMarker = Errorf("Delete marker cannot be specified with Days or Date in a Lifecycle Expiration Policy")
 	errLifecycleDateNotMidnight     = Errorf("'Date' must be at midnight GMT")
 )
@@ -49,11 +49,11 @@ func (eDays *ExpirationDays) UnmarshalXML(d *xml.Decoder, startElement xml.Start
 
 // MarshalXML encodes number of days to expire if it is non-zero and
 // encodes empty string otherwise
-func (eDays *ExpirationDays) MarshalXML(e *xml.Encoder, startElement xml.StartElement) error {
-	if *eDays == ExpirationDays(0) {
+func (eDays ExpirationDays) MarshalXML(e *xml.Encoder, startElement xml.StartElement) error {
+	if eDays == 0 {
 		return nil
 	}
-	return e.EncodeElement(int(*eDays), startElement)
+	return e.EncodeElement(int(eDays), startElement)
 }
 
 // ExpirationDate is a embedded type containing time.Time to unmarshal
@@ -90,57 +90,84 @@ func (eDate *ExpirationDate) UnmarshalXML(d *xml.Decoder, startElement xml.Start
 
 // MarshalXML encodes expiration date if it is non-zero and encodes
 // empty string otherwise
-func (eDate *ExpirationDate) MarshalXML(e *xml.Encoder, startElement xml.StartElement) error {
-	if *eDate == (ExpirationDate{time.Time{}}) {
+func (eDate ExpirationDate) MarshalXML(e *xml.Encoder, startElement xml.StartElement) error {
+	if eDate.Time.IsZero() {
 		return nil
 	}
 	return e.EncodeElement(eDate.Format(time.RFC3339), startElement)
 }
 
 // ExpireDeleteMarker represents value of ExpiredObjectDeleteMarker field in Expiration XML element.
-type ExpireDeleteMarker bool
+type ExpireDeleteMarker struct {
+	val bool
+	set bool
+}
 
 // Expiration - expiration actions for a rule in lifecycle configuration.
 type Expiration struct {
 	XMLName      xml.Name           `xml:"Expiration"`
 	Days         ExpirationDays     `xml:"Days,omitempty"`
 	Date         ExpirationDate     `xml:"Date,omitempty"`
-	DeleteMarker ExpireDeleteMarker `xml:"ExpiredObjectDeleteMarker,omitempty"`
-}
+	DeleteMarker ExpireDeleteMarker `xml:"ExpiredObjectDeleteMarker"`
 
-// UnmarshalXML parses delete marker and validates if it is set.
-func (b *ExpireDeleteMarker) UnmarshalXML(d *xml.Decoder, startElement xml.StartElement) error {
-	if !*b {
-		return nil
-	}
-	var deleteMarker bool
-	err := d.DecodeElement(&deleteMarker, &startElement)
-	if err != nil {
-		return err
-	}
-	*b = ExpireDeleteMarker(deleteMarker)
-	return nil
+	set bool
 }
 
 // MarshalXML encodes delete marker boolean into an XML form.
-func (b *ExpireDeleteMarker) MarshalXML(e *xml.Encoder, startElement xml.StartElement) error {
-	if !*b {
+func (b ExpireDeleteMarker) MarshalXML(e *xml.Encoder, startElement xml.StartElement) error {
+	if !b.set {
 		return nil
 	}
-	return e.EncodeElement(*b, startElement)
+	return e.EncodeElement(b.val, startElement)
+}
+
+// UnmarshalXML decodes delete marker boolean from the XML form.
+func (b *ExpireDeleteMarker) UnmarshalXML(d *xml.Decoder, startElement xml.StartElement) error {
+	var exp bool
+	err := d.DecodeElement(&exp, &startElement)
+	if err != nil {
+		return err
+	}
+	b.val = exp
+	b.set = true
+	return nil
+}
+
+// MarshalXML encodes expiration field into an XML form.
+func (e Expiration) MarshalXML(enc *xml.Encoder, startElement xml.StartElement) error {
+	if !e.set {
+		return nil
+	}
+	type expirationWrapper Expiration
+	return enc.EncodeElement(expirationWrapper(e), startElement)
+}
+
+// UnmarshalXML decodes expiration field from the XML form.
+func (e *Expiration) UnmarshalXML(d *xml.Decoder, startElement xml.StartElement) error {
+	type expirationWrapper Expiration
+	var exp expirationWrapper
+	err := d.DecodeElement(&exp, &startElement)
+	if err != nil {
+		return err
+	}
+	*e = Expiration(exp)
+	e.set = true
+	return nil
 }
 
 // Validate - validates the "Expiration" element
 func (e Expiration) Validate() error {
+	if !e.set {
+		return nil
+	}
+
 	// DeleteMarker cannot be specified if date or dates are specified.
-	if (!e.IsDateNull() || !e.IsDateNull()) && bool(e.DeleteMarker) {
+	if (!e.IsDaysNull() || !e.IsDateNull()) && e.DeleteMarker.set {
 		return errLifecycleInvalidDeleteMarker
 	}
 
-	// Neither expiration days or date is specified
-	// if delete marker is false one of them should be specified
-	if !bool(e.DeleteMarker) && e.IsDaysNull() && e.IsDateNull() {
-		return errLifecycleInvalidExpiration
+	if !e.DeleteMarker.set && e.IsDaysNull() && e.IsDateNull() {
+		return errXMLNotWellFormed
 	}
 
 	// Both expiration days and date are specified

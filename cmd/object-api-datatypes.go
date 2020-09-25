@@ -22,6 +22,7 @@ import (
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
+	"github.com/minio/minio/pkg/bucket/replication"
 	"github.com/minio/minio/pkg/hash"
 	"github.com/minio/minio/pkg/madmin"
 )
@@ -43,13 +44,7 @@ const (
 
 // StorageInfo - represents total capacity of underlying storage.
 type StorageInfo struct {
-	Used []uint64 // Used total used per disk.
-
-	Total []uint64 // Total disk space per disk.
-
-	Available []uint64 // Total disk space available per disk.
-
-	MountPaths []string // Disk mountpoints
+	Disks []madmin.Disk
 
 	// Backend type.
 	Backend struct {
@@ -66,9 +61,6 @@ type StorageInfo struct {
 		StandardSCParity int                 // Parity disks for currently configured Standard storage class.
 		RRSCData         int                 // Data disks for currently configured Reduced Redundancy storage class.
 		RRSCParity       int                 // Parity disks for currently configured Reduced Redundancy storage class.
-
-		// List of all disk status, this is only meaningful if BackendType is Erasure.
-		Sets [][]madmin.DriveInfo
 	}
 }
 
@@ -190,6 +182,7 @@ type ObjectInfo struct {
 	// Specify object storage class
 	StorageClass string
 
+	ReplicationStatus replication.StatusType
 	// User-Defined metadata
 	UserDefined map[string]string
 
@@ -205,10 +198,13 @@ type ObjectInfo struct {
 	PutObjReader *PutObjReader  `json:"-"`
 
 	metadataOnly bool
+	versionOnly  bool // adds a new version, only used by CopyObject
 	keyRotation  bool
 
 	// Date and time when the object was last accessed.
 	AccTime time.Time
+
+	Legacy bool // indicates object on disk is in legacy data format
 
 	// backendType indicates which backend filled this structure
 	backendType BackendType
@@ -367,9 +363,6 @@ type ListObjectVersionsInfo struct {
 
 	// List of objects info for this request.
 	Objects []ObjectInfo
-
-	// List of deleted objects for this request.
-	DeleteObjects []DeletedObjectInfo
 
 	// List of prefixes for this request.
 	Prefixes []string

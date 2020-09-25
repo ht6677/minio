@@ -23,11 +23,13 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/minio/minio-go/v6/pkg/tags"
+	"github.com/minio/minio-go/v7/pkg/tags"
+	"github.com/minio/minio/cmd/logger"
 	bucketsse "github.com/minio/minio/pkg/bucket/encryption"
 	"github.com/minio/minio/pkg/bucket/lifecycle"
 	objectlock "github.com/minio/minio/pkg/bucket/object/lock"
 	"github.com/minio/minio/pkg/bucket/policy"
+	"github.com/minio/minio/pkg/bucket/replication"
 	"github.com/minio/minio/pkg/bucket/versioning"
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/madmin"
@@ -77,7 +79,44 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 
 	if globalIsGateway {
 		// This code is needed only for gateway implementations.
-		if configFile == bucketPolicyConfig {
+		switch configFile {
+		case bucketSSEConfig:
+			if globalGatewayName == NASBackendGateway {
+				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
+				if err != nil {
+					return err
+				}
+				meta.EncryptionConfigXML = configData
+				return meta.Save(GlobalContext, objAPI)
+			}
+		case bucketLifecycleConfig:
+			if globalGatewayName == NASBackendGateway {
+				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
+				if err != nil {
+					return err
+				}
+				meta.LifecycleConfigXML = configData
+				return meta.Save(GlobalContext, objAPI)
+			}
+		case bucketTaggingConfig:
+			if globalGatewayName == NASBackendGateway {
+				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
+				if err != nil {
+					return err
+				}
+				meta.TaggingConfigXML = configData
+				return meta.Save(GlobalContext, objAPI)
+			}
+		case bucketNotificationConfig:
+			if globalGatewayName == NASBackendGateway {
+				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
+				if err != nil {
+					return err
+				}
+				meta.NotificationConfigXML = configData
+				return meta.Save(GlobalContext, objAPI)
+			}
+		case bucketPolicyConfig:
 			if configData == nil {
 				return objAPI.DeleteBucketPolicy(GlobalContext, bucket)
 			}
@@ -108,14 +147,30 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 		meta.LifecycleConfigXML = configData
 	case bucketSSEConfig:
 		meta.EncryptionConfigXML = configData
-	case bucketTaggingConfigFile:
+	case bucketTaggingConfig:
 		meta.TaggingConfigXML = configData
-	case objectLockConfig:
-		meta.ObjectLockConfigXML = configData
-	case bucketVersioningConfig:
-		meta.VersioningConfigXML = configData
 	case bucketQuotaConfigFile:
 		meta.QuotaConfigJSON = configData
+	case objectLockConfig:
+		if !globalIsErasure && !globalIsDistErasure {
+			return NotImplemented{}
+		}
+		meta.ObjectLockConfigXML = configData
+	case bucketVersioningConfig:
+		if !globalIsErasure && !globalIsDistErasure {
+			return NotImplemented{}
+		}
+		meta.VersioningConfigXML = configData
+	case bucketReplicationConfig:
+		if !globalIsErasure && !globalIsDistErasure {
+			return NotImplemented{}
+		}
+		meta.ReplicationConfigXML = configData
+	case bucketTargetsFile:
+		if !globalIsErasure && !globalIsDistErasure {
+			return NotImplemented{}
+		}
+		meta.BucketTargetsConfigJSON = configData
 	default:
 		return fmt.Errorf("Unknown bucket %s metadata update requested %s", bucket, configFile)
 	}
@@ -134,6 +189,13 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 // If no metadata exists errConfigNotFound is returned and a new metadata is returned.
 // Only a shallow copy is returned, so referenced data should not be modified,
 // but can be replaced atomically.
+//
+// This function should only be used with
+// - GetBucketInfo
+// - ListBuckets
+// - ListBucketsHeal (only in case of erasure coding mode)
+// For all other bucket specific metadata, use the relevant
+// calls implemented specifically for each of those features.
 func (sys *BucketMetadataSys) Get(bucket string) (BucketMetadata, error) {
 	if globalIsGateway || bucket == minioMetaBucket {
 		return newBucketMetadata(bucket), errConfigNotFound
@@ -211,7 +273,7 @@ func (sys *BucketMetadataSys) GetLifecycleConfig(bucket string) (*lifecycle.Life
 // GetNotificationConfig returns configured notification config
 // The returned object may not be modified.
 func (sys *BucketMetadataSys) GetNotificationConfig(bucket string) (*event.Config, error) {
-	if globalIsGateway && globalGatewayName == "nas" {
+	if globalIsGateway && globalGatewayName == NASBackendGateway {
 		// Only needed in case of NAS gateway.
 		objAPI := newObjectLayerWithoutSafeModeFn()
 		if objAPI == nil {
@@ -281,7 +343,37 @@ func (sys *BucketMetadataSys) GetQuotaConfig(bucket string) (*madmin.BucketQuota
 	return meta.quotaConfig, nil
 }
 
-// GetConfig returns the current bucket metadata
+// GetReplicationConfig returns configured bucket replication config
+// The returned object may not be modified.
+func (sys *BucketMetadataSys) GetReplicationConfig(ctx context.Context, bucket string) (*replication.Config, error) {
+	meta, err := sys.GetConfig(bucket)
+	if err != nil {
+		if errors.Is(err, errConfigNotFound) {
+			return nil, BucketReplicationConfigNotFound{Bucket: bucket}
+		}
+		return nil, err
+	}
+
+	if meta.replicationConfig == nil {
+		return nil, BucketReplicationConfigNotFound{Bucket: bucket}
+	}
+	return meta.replicationConfig, nil
+}
+
+// GetBucketTargetsConfig returns configured bucket targets for this bucket
+// The returned object may not be modified.
+func (sys *BucketMetadataSys) GetBucketTargetsConfig(bucket string) (*madmin.BucketTargets, error) {
+	meta, err := sys.GetConfig(bucket)
+	if err != nil {
+		return nil, err
+	}
+	if meta.bucketTargetConfig == nil {
+		return nil, BucketRemoteTargetNotFound{Bucket: bucket}
+	}
+	return meta.bucketTargetConfig, nil
+}
+
+// GetConfig returns a specific configuration from the bucket metadata.
 // The returned object may not be modified.
 func (sys *BucketMetadataSys) GetConfig(bucket string) (BucketMetadata, error) {
 	objAPI := newObjectLayerWithoutSafeModeFn()
@@ -325,8 +417,9 @@ func (sys *BucketMetadataSys) Init(ctx context.Context, buckets []BucketInfo, ob
 		return nil
 	}
 
-	// Load PolicySys once during boot.
-	return sys.load(ctx, buckets, objAPI)
+	// Load bucket metadata sys in background
+	go logger.LogIf(ctx, sys.load(ctx, buckets, objAPI))
+	return nil
 }
 
 // concurrently load bucket metadata to speed up loading bucket metadata.

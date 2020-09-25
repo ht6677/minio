@@ -39,19 +39,9 @@ const (
 	// Add your own backend.
 )
 
-// DriveInfo - represents each drive info, describing
-// status, uuid and endpoint.
-type DriveInfo HealDriveInfo
-
 // StorageInfo - represents total capacity of underlying storage.
 type StorageInfo struct {
-	Used []uint64 // Used total used per disk.
-
-	Total []uint64 // Total disk space per disk.
-
-	Available []uint64 // Total disk space available per disk.
-
-	MountPaths []string // Disk mountpoints
+	Disks []Disk
 
 	// Backend type.
 	Backend struct {
@@ -65,9 +55,6 @@ type StorageInfo struct {
 		StandardSCParity int          // Parity disks for currently configured Standard storage class.
 		RRSCData         int          // Data disks for currently configured Reduced Redundancy storage class.
 		RRSCParity       int          // Parity disks for currently configured Reduced Redundancy storage class.
-
-		// List of all disk status, this is only meaningful if BackendType is Erasure.
-		Sets [][]DriveInfo
 	}
 }
 
@@ -277,17 +264,21 @@ type ServerProperties struct {
 	Version  string            `json:"version,omitempty"`
 	CommitID string            `json:"commitID,omitempty"`
 	Network  map[string]string `json:"network,omitempty"`
-	Disks    []Disk            `json:"disks,omitempty"`
+	Disks    []Disk            `json:"drives,omitempty"`
 }
 
 // Disk holds Disk information
 type Disk struct {
+	Endpoint        string  `json:"endpoint,omitempty"`
+	RootDisk        bool    `json:"rootDisk,omitempty"`
 	DrivePath       string  `json:"path,omitempty"`
+	Healing         bool    `json:"healing,omitempty"`
 	State           string  `json:"state,omitempty"`
 	UUID            string  `json:"uuid,omitempty"`
 	Model           string  `json:"model,omitempty"`
 	TotalSpace      uint64  `json:"totalspace,omitempty"`
 	UsedSpace       uint64  `json:"usedspace,omitempty"`
+	AvailableSpace  uint64  `json:"availspace,omitempty"`
 	ReadThroughput  float64 `json:"readthroughput,omitempty"`
 	WriteThroughPut float64 `json:"writethroughput,omitempty"`
 	ReadLatency     float64 `json:"readlatency,omitempty"`

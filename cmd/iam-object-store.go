@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	jwtgo "github.com/dgrijalva/jwt-go"
 
@@ -150,7 +151,7 @@ func (iamOS *IAMObjectStore) migrateUsersConfigToV1(ctx context.Context, isSTS b
 		cred.AccessKey = user
 		u := newUserIdentity(cred)
 		if err := iamOS.saveIAMConfig(u, identityPath); err != nil {
-			logger.LogIf(context.Background(), err)
+			logger.LogIf(ctx, err)
 			return err
 		}
 
@@ -215,7 +216,7 @@ func (iamOS *IAMObjectStore) saveIAMConfig(item interface{}, path string) error 
 			return err
 		}
 	}
-	return saveConfig(context.Background(), iamOS.objAPI, path, data)
+	return saveConfig(GlobalContext, iamOS.objAPI, path, data)
 }
 
 func (iamOS *IAMObjectStore) loadIAMConfig(item interface{}, path string) error {
@@ -223,7 +224,7 @@ func (iamOS *IAMObjectStore) loadIAMConfig(item interface{}, path string) error 
 	if err != nil {
 		return err
 	}
-	if globalConfigEncrypted {
+	if globalConfigEncrypted && !utf8.Valid(data) {
 		data, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(data))
 		if err != nil {
 			return err
@@ -256,8 +257,7 @@ func (iamOS *IAMObjectStore) loadPolicyDocs(ctx context.Context, m map[string]ia
 		}
 
 		policyName := item.Item
-		err := iamOS.loadPolicyDoc(policyName, m)
-		if err != nil {
+		if err := iamOS.loadPolicyDoc(policyName, m); err != nil && err != errNoSuchPolicy {
 			return err
 		}
 	}
@@ -304,6 +304,7 @@ func (iamOS *IAMObjectStore) loadUser(user string, userType IAMUserType, m map[s
 	if u.Credentials.AccessKey == "" {
 		u.Credentials.AccessKey = user
 	}
+
 	m[user] = u.Credentials
 	return nil
 }
@@ -325,8 +326,7 @@ func (iamOS *IAMObjectStore) loadUsers(ctx context.Context, userType IAMUserType
 		}
 
 		userName := item.Item
-		err := iamOS.loadUser(userName, userType, m)
-		if err != nil {
+		if err := iamOS.loadUser(userName, userType, m); err != nil && err != errNoSuchUser {
 			return err
 		}
 	}
@@ -353,8 +353,7 @@ func (iamOS *IAMObjectStore) loadGroups(ctx context.Context, m map[string]GroupI
 		}
 
 		group := item.Item
-		err := iamOS.loadGroup(group, m)
-		if err != nil {
+		if err := iamOS.loadGroup(group, m); err != nil && err != errNoSuchGroup {
 			return err
 		}
 	}
@@ -397,8 +396,7 @@ func (iamOS *IAMObjectStore) loadMappedPolicies(ctx context.Context, userType IA
 
 		policyFile := item.Item
 		userOrGroupName := strings.TrimSuffix(policyFile, ".json")
-		err := iamOS.loadMappedPolicy(userOrGroupName, userType, isGroup, m)
-		if err != nil && err != errNoSuchPolicy {
+		if err := iamOS.loadMappedPolicy(userOrGroupName, userType, isGroup, m); err != nil && err != errNoSuchPolicy {
 			return err
 		}
 	}
@@ -477,11 +475,24 @@ func (iamOS *IAMObjectStore) loadAll(ctx context.Context, sys *IAMSys) error {
 	}
 
 	// purge any expired entries which became expired now.
+	var expiredEntries []string
 	for k, v := range sys.iamUsersMap {
 		if v.IsExpired() {
 			delete(sys.iamUsersMap, k)
 			delete(sys.iamUserPolicyMap, k)
+			expiredEntries = append(expiredEntries, k)
 			// Deleting on the disk is taken care of in the next cycle
+		}
+	}
+
+	for _, v := range sys.iamUsersMap {
+		if v.IsServiceAccount() {
+			for _, accessKey := range expiredEntries {
+				if v.ParentUser == accessKey {
+					_ = iamOS.deleteUserIdentity(v.AccessKey, srvAccUser)
+					delete(sys.iamUsersMap, v.AccessKey)
+				}
+			}
 		}
 	}
 
@@ -575,7 +586,7 @@ func listIAMConfigItems(ctx context.Context, objAPI ObjectLayer, pathPrefix stri
 
 		marker := ""
 		for {
-			lo, err := objAPI.ListObjects(context.Background(),
+			lo, err := objAPI.ListObjects(ctx,
 				minioMetaBucket, pathPrefix, marker, SlashSeparator, maxObjectList)
 			if err != nil {
 				select {

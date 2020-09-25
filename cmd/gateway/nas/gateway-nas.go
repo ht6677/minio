@@ -24,10 +24,6 @@ import (
 	"github.com/minio/minio/pkg/auth"
 )
 
-const (
-	nasBackend = "nas"
-)
-
 func init() {
 	const nasGatewayTemplate = `NAME:
   {{.HelpName}} - {{.Usage}}
@@ -61,7 +57,7 @@ EXAMPLES:
 `
 
 	minio.RegisterGatewayCommand(cli.Command{
-		Name:               nasBackend,
+		Name:               minio.NASBackendGateway,
 		Usage:              "Network-attached storage (NAS)",
 		Action:             nasGatewayMain,
 		CustomHelpTemplate: nasGatewayTemplate,
@@ -73,7 +69,7 @@ EXAMPLES:
 func nasGatewayMain(ctx *cli.Context) {
 	// Validate gateway arguments.
 	if !ctx.Args().Present() || ctx.Args().First() == "help" {
-		cli.ShowCommandHelpAndExit(ctx, nasBackend, 1)
+		cli.ShowCommandHelpAndExit(ctx, minio.NASBackendGateway, 1)
 	}
 
 	minio.StartGateway(ctx, &NAS{ctx.Args().First()})
@@ -86,7 +82,7 @@ type NAS struct {
 
 // Name implements Gateway interface.
 func (g *NAS) Name() string {
-	return nasBackend
+	return minio.NASBackendGateway
 }
 
 // NewGatewayLayer returns nas gatewaylayer.
@@ -104,8 +100,8 @@ func (g *NAS) Production() bool {
 	return true
 }
 
-// IsListenBucketSupported returns whether listen bucket notification is applicable for this gateway.
-func (n *nasObjects) IsListenBucketSupported() bool {
+// IsListenSupported returns whether listen bucket notification is applicable for this gateway.
+func (n *nasObjects) IsListenSupported() bool {
 	return false
 }
 
@@ -119,12 +115,6 @@ func (n *nasObjects) StorageInfo(ctx context.Context, _ bool) (si minio.StorageI
 // nasObjects implements gateway for MinIO and S3 compatible object storage servers.
 type nasObjects struct {
 	minio.ObjectLayer
-}
-
-// IsReady returns whether the layer is ready to take requests.
-func (n *nasObjects) IsReady(ctx context.Context) bool {
-	si, _ := n.StorageInfo(ctx, false)
-	return si.Backend.GatewayOnline
 }
 
 func (n *nasObjects) IsTaggingSupported() bool {

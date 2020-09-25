@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net/http"
@@ -27,35 +28,46 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/minio/minio/cmd/config"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/cmd/rest"
 	"github.com/minio/minio/pkg/sync/errgroup"
 )
 
-var printEndpointError = func() func(Endpoint, error) {
+var printEndpointError = func() func(Endpoint, error, bool) {
 	var mutex sync.Mutex
-	printOnce := make(map[Endpoint]map[string]bool)
+	printOnce := make(map[Endpoint]map[string]int)
 
-	return func(endpoint Endpoint, err error) {
+	return func(endpoint Endpoint, err error, once bool) {
 		reqInfo := (&logger.ReqInfo{}).AppendTags("endpoint", endpoint.String())
 		ctx := logger.SetReqInfo(GlobalContext, reqInfo)
 		mutex.Lock()
 		defer mutex.Unlock()
+
 		m, ok := printOnce[endpoint]
 		if !ok {
-			m = make(map[string]bool)
-			m[err.Error()] = true
+			m = make(map[string]int)
+			m[err.Error()]++
 			printOnce[endpoint] = m
-			logger.LogAlwaysIf(ctx, err)
+			if once {
+				logger.LogAlwaysIf(ctx, err)
+				return
+			}
+		}
+		// Once is set and we are here means error was already
+		// printed once.
+		if once {
 			return
 		}
-		if m[err.Error()] {
-			return
+		// once not set, check if same error occurred 3 times in
+		// a row, then make sure we print it to call attention.
+		if m[err.Error()] > 2 {
+			logger.LogAlwaysIf(ctx, fmt.Errorf("Following error has been printed %d times.. %w", m[err.Error()], err))
+			// Reduce the count to introduce further delay in printing
+			// but let it again print after the 2th attempt
+			m[err.Error()]--
+			m[err.Error()]--
 		}
-		m[err.Error()] = true
-		logger.LogAlwaysIf(ctx, err)
+		m[err.Error()]++
 	}
 }()
 
@@ -173,19 +185,35 @@ func IsServerResolvable(endpoint Endpoint) error {
 		tlsConfig = &tls.Config{
 			ServerName: endpoint.Hostname(),
 			RootCAs:    globalRootCAs,
-			NextProtos: []string{"http/1.1"}, // Force http1.1
 		}
 	}
 
-	req, err := http.NewRequest(http.MethodGet, serverURL.String(), nil)
+	httpClient := &http.Client{
+		Transport:
+		// For more details about various values used here refer
+		// https://golang.org/pkg/net/http/#Transport documentation
+		&http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           xhttp.NewCustomDialContext(3 * time.Second),
+			ResponseHeaderTimeout: 5 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ExpectContinueTimeout: 5 * time.Second,
+			TLSClientConfig:       tlsConfig,
+			// Go net/http automatically unzip if content-type is
+			// gzip disable this feature, as we are always interested
+			// in raw stream.
+			DisableCompression: true,
+		},
+	}
+	defer httpClient.CloseIdleConnections()
+
+	ctx, cancel := context.WithTimeout(GlobalContext, 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverURL.String(), nil)
 	if err != nil {
 		return err
 	}
-
-	httpClient := &http.Client{
-		Transport: newCustomHTTPTransport(tlsConfig, rest.DefaultRESTTimeout)(),
-	}
-	defer httpClient.CloseIdleConnections()
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -202,7 +230,7 @@ func IsServerResolvable(endpoint Endpoint) error {
 // connect to list of endpoints and load all Erasure disk formats, validate the formats are correct
 // and are in quorum, if no formats are found attempt to initialize all of them for the first
 // time. additionally make sure to close all the disks used in this attempt.
-func connectLoadInitFormats(retryCount int, firstDisk bool, endpoints Endpoints, zoneCount, setCount, drivesPerSet int, deploymentID string) (storageDisks []StorageAPI, format *formatErasureV3, err error) {
+func connectLoadInitFormats(retryCount int, firstDisk bool, endpoints Endpoints, zoneCount, setCount, setDriveCount int, deploymentID string) (storageDisks []StorageAPI, format *formatErasureV3, err error) {
 	// Initialize all storage disks
 	storageDisks, errs := initStorageDisksWithErrors(endpoints)
 
@@ -227,10 +255,7 @@ func connectLoadInitFormats(retryCount int, firstDisk bool, endpoints Endpoints,
 	formatConfigs, sErrs := loadFormatErasureAll(storageDisks, false)
 	// Check if we have
 	for i, sErr := range sErrs {
-		if _, ok := formatCriticalErrors[sErr]; ok {
-			return nil, nil, config.ErrCorruptedBackend(err).Hint(fmt.Sprintf("Clear any pre-existing content on %s", endpoints[i]))
-		}
-		// not critical error but still print the error, nonetheless, which is perhaps unhandled
+		// print the error, nonetheless, which is perhaps unhandled
 		if sErr != errUnformattedDisk && sErr != errDiskNotFound && retryCount >= 5 {
 			if sErr != nil {
 				logger.Info("Unable to read 'format.json' from %s: %v\n", endpoints[i], sErr)
@@ -243,17 +268,17 @@ func connectLoadInitFormats(retryCount int, firstDisk bool, endpoints Endpoints,
 	// most part unless one of the formats is not consistent
 	// with expected Erasure format. For example if a user is
 	// trying to pool FS backend into an Erasure set.
-	if err = checkFormatErasureValues(formatConfigs, drivesPerSet); err != nil {
+	if err = checkFormatErasureValues(formatConfigs, setDriveCount); err != nil {
 		return nil, nil, err
 	}
 
 	// All disks report unformatted we should initialized everyone.
 	if shouldInitErasureDisks(sErrs) && firstDisk {
 		logger.Info("Formatting %s zone, %v set(s), %v drives per set.",
-			humanize.Ordinal(zoneCount), setCount, drivesPerSet)
+			humanize.Ordinal(zoneCount), setCount, setDriveCount)
 
 		// Initialize erasure code format on disks
-		format, err = initFormatErasure(GlobalContext, storageDisks, setCount, drivesPerSet, deploymentID)
+		format, err = initFormatErasure(GlobalContext, storageDisks, setCount, setDriveCount, deploymentID, sErrs)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -275,6 +300,9 @@ func connectLoadInitFormats(retryCount int, firstDisk bool, endpoints Endpoints,
 	if quorumUnformattedDisks(sErrs) && firstDisk {
 		return nil, nil, errFirstDiskWait
 	}
+
+	// Mark all root disks down
+	markRootDisksAsDown(storageDisks, sErrs)
 
 	// Following function is added to fix a regressions which was introduced
 	// in release RELEASE.2018-03-16T22-52-12Z after migrating v1 to v2 to v3.
@@ -319,8 +347,8 @@ func connectLoadInitFormats(retryCount int, firstDisk bool, endpoints Endpoints,
 }
 
 // Format disks before initialization of object layer.
-func waitForFormatErasure(firstDisk bool, endpoints Endpoints, zoneCount, setCount, drivesPerSet int, deploymentID string) ([]StorageAPI, *formatErasureV3, error) {
-	if len(endpoints) == 0 || setCount == 0 || drivesPerSet == 0 {
+func waitForFormatErasure(firstDisk bool, endpoints Endpoints, zoneCount, setCount, setDriveCount int, deploymentID string) ([]StorageAPI, *formatErasureV3, error) {
+	if len(endpoints) == 0 || setCount == 0 || setDriveCount == 0 {
 		return nil, nil, errInvalidArgument
 	}
 
@@ -346,7 +374,7 @@ func waitForFormatErasure(firstDisk bool, endpoints Endpoints, zoneCount, setCou
 	for {
 		select {
 		case <-ticker.C:
-			storageDisks, format, err := connectLoadInitFormats(tries, firstDisk, endpoints, zoneCount, setCount, drivesPerSet, deploymentID)
+			storageDisks, format, err := connectLoadInitFormats(tries, firstDisk, endpoints, zoneCount, setCount, setDriveCount, deploymentID)
 			if err != nil {
 				tries++
 				switch err {

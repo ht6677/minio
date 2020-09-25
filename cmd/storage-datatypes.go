@@ -57,7 +57,6 @@ type FileInfoVersions struct {
 	LatestModTime time.Time
 
 	Versions []FileInfo
-	Deleted  []FileInfo
 }
 
 // FileInfo - represents file stat information.
@@ -80,6 +79,9 @@ type FileInfo struct {
 
 	// DataDir of the file
 	DataDir string
+
+	// Indicates if this object is still in V1 format.
+	XLV1 bool
 
 	// Date and time when the file was last modified, if Deleted
 	// is 'true' this value represents when while was deleted.

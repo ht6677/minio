@@ -48,9 +48,6 @@ const (
 	dataUpdateTrackerFilename     = dataUsageBucket + SlashSeparator + ".tracker.bin"
 	dataUpdateTrackerVersion      = 2
 	dataUpdateTrackerSaveInterval = 5 * time.Minute
-
-	// Reset bloom filters every n cycle
-	dataUpdateTrackerResetEvery = 1000
 )
 
 var (
@@ -120,8 +117,8 @@ func (b bloomFilter) containsDir(in string) bool {
 }
 
 // bytes returns the bloom filter serialized as a byte slice.
-func (b bloomFilter) bytes() []byte {
-	if b.BloomFilter == nil {
+func (b *bloomFilter) bytes() []byte {
+	if b == nil || b.BloomFilter == nil {
 		return nil
 	}
 	var buf bytes.Buffer
@@ -181,6 +178,8 @@ func (d *dataUpdateTracker) start(ctx context.Context, drives ...string) {
 	}
 	d.load(ctx, drives...)
 	go d.startCollector(ctx)
+	// startSaver will unlock.
+	d.mu.Lock()
 	go d.startSaver(ctx, dataUpdateTrackerSaveInterval, drives)
 }
 
@@ -206,7 +205,7 @@ func (d *dataUpdateTracker) load(ctx context.Context, drives ...string) {
 			continue
 		}
 		err = d.deserialize(f, d.Saved)
-		if err != nil && err != io.EOF {
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			logger.LogIf(ctx, err)
 		}
 		f.Close()
@@ -214,17 +213,17 @@ func (d *dataUpdateTracker) load(ctx context.Context, drives ...string) {
 }
 
 // startSaver will start a saver that will write d to all supplied drives at specific intervals.
+// 'd' must be write locked when started and will be unlocked.
 // The saver will save and exit when supplied context is closed.
 func (d *dataUpdateTracker) startSaver(ctx context.Context, interval time.Duration, drives []string) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	var buf bytes.Buffer
-	d.mu.Lock()
 	saveNow := d.save
 	exited := make(chan struct{})
 	d.saveExited = exited
 	d.mu.Unlock()
+	t := time.NewTicker(interval)
+	defer t.Stop()
 	defer close(exited)
+	var buf bytes.Buffer
 	for {
 		var exit bool
 		select {
@@ -427,6 +426,8 @@ func (d *dataUpdateTracker) deserialize(src io.Reader, newerThan time.Time) erro
 	}
 	// Ignore what remains on the stream.
 	// Update d:
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.Current = dst.Current
 	d.History = dst.History
 	d.Saved = dst.Saved

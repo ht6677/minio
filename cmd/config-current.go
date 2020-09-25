@@ -25,8 +25,9 @@ import (
 	"github.com/minio/minio/cmd/config/api"
 	"github.com/minio/minio/cmd/config/cache"
 	"github.com/minio/minio/cmd/config/compress"
+	"github.com/minio/minio/cmd/config/crawler"
+	"github.com/minio/minio/cmd/config/dns"
 	"github.com/minio/minio/cmd/config/etcd"
-	"github.com/minio/minio/cmd/config/etcd/dns"
 	xldap "github.com/minio/minio/cmd/config/identity/ldap"
 	"github.com/minio/minio/cmd/config/identity/openid"
 	"github.com/minio/minio/cmd/config/notify"
@@ -55,6 +56,7 @@ func initHelp() {
 		config.KmsKesSubSys:         crypto.DefaultKesKVS,
 		config.LoggerWebhookSubSys:  logger.DefaultKVS,
 		config.AuditWebhookSubSys:   logger.DefaultAuditKVS,
+		config.CrawlerSubSys:        crawler.DefaultKVS,
 	}
 	for k, v := range notify.DefaultNotificationKVS {
 		kvs[k] = v
@@ -92,7 +94,7 @@ func initHelp() {
 		},
 		config.HelpKV{
 			Key:         config.PolicyOPASubSys,
-			Description: "enable external OPA for policy enforcement",
+			Description: "[DEPRECATED] enable external OPA for policy enforcement",
 		},
 		config.HelpKV{
 			Key:         config.KmsVaultSubSys,
@@ -105,6 +107,10 @@ func initHelp() {
 		config.HelpKV{
 			Key:         config.APISubSys,
 			Description: "manage global HTTP API call specific features, such as throttling, authentication types, etc.",
+		},
+		config.HelpKV{
+			Key:         config.CrawlerSubSys,
+			Description: "manage continuous disk crawling for bucket disk usage, lifecycle, quota and data integrity checks",
 		},
 		config.HelpKV{
 			Key:             config.LoggerWebhookSubSys,
@@ -185,6 +191,7 @@ func initHelp() {
 		config.EtcdSubSys:           etcd.Help,
 		config.CacheSubSys:          cache.Help,
 		config.CompressionSubSys:    compress.Help,
+		config.CrawlerSubSys:        crawler.Help,
 		config.IdentityOpenIDSubSys: openid.Help,
 		config.IdentityLDAPSubSys:   xldap.Help,
 		config.PolicyOPASubSys:      opa.Help,
@@ -213,7 +220,7 @@ var (
 	globalServerConfigMu sync.RWMutex
 )
 
-func validateConfig(s config.Config) error {
+func validateConfig(s config.Config, setDriveCount int) error {
 	// Disable merging env values with config for validation.
 	env.SetEnvOff()
 
@@ -233,8 +240,7 @@ func validateConfig(s config.Config) error {
 	}
 
 	if globalIsErasure {
-		if _, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default],
-			globalErasureSetDriveCount); err != nil {
+		if _, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount); err != nil {
 			return err
 		}
 	}
@@ -244,6 +250,10 @@ func validateConfig(s config.Config) error {
 	}
 
 	if _, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default]); err != nil {
+		return err
+	}
+
+	if _, err := crawler.LookupConfig(s[config.CrawlerSubSys][config.Default]); err != nil {
 		return err
 	}
 
@@ -307,11 +317,10 @@ func validateConfig(s config.Config) error {
 		return err
 	}
 
-	return notify.TestNotificationTargets(s, GlobalContext.Done(), NewGatewayHTTPTransport(),
-		globalNotificationSys.ConfiguredTargetIDs())
+	return notify.TestNotificationTargets(GlobalContext, s, NewGatewayHTTPTransport(), globalNotificationSys.ConfiguredTargetIDs())
 }
 
-func lookupConfigs(s config.Config) {
+func lookupConfigs(s config.Config, setDriveCount int) {
 	ctx := GlobalContext
 
 	var err error
@@ -323,15 +332,61 @@ func lookupConfigs(s config.Config) {
 		}
 	}
 
+	if dnsURL, dnsUser, dnsPass, ok := env.LookupEnv(config.EnvDNSWebhook); ok {
+		globalDNSConfig, err = dns.NewOperatorDNS(dnsURL,
+			dns.Authentication(dnsUser, dnsPass),
+			dns.RootCAs(globalRootCAs))
+		if err != nil {
+			if globalIsGateway {
+				logger.FatalIf(err, "Unable to initialize remote webhook DNS config")
+			} else {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize remote webhook DNS config %w", err))
+			}
+		}
+	}
+
 	etcdCfg, err := etcd.LookupConfig(s[config.EtcdSubSys][config.Default], globalRootCAs)
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
+		if globalIsGateway {
+			logger.FatalIf(err, "Unable to initialize etcd config")
+		} else {
+			logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
+		}
 	}
 
 	if etcdCfg.Enabled {
-		globalEtcdClient, err = etcd.New(etcdCfg)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
+		if globalEtcdClient == nil {
+			globalEtcdClient, err = etcd.New(etcdCfg)
+			if err != nil {
+				if globalIsGateway {
+					logger.FatalIf(err, "Unable to initialize etcd config")
+				} else {
+					logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
+				}
+			}
+		}
+
+		if len(globalDomainNames) != 0 && !globalDomainIPs.IsEmpty() && globalEtcdClient != nil {
+			if globalDNSConfig != nil {
+				// if global DNS is already configured, indicate with a warning, incase
+				// users are confused.
+				logger.LogIf(ctx, fmt.Errorf("DNS store is already configured with %s, not using etcd for DNS store", globalDNSConfig))
+			} else {
+				globalDNSConfig, err = dns.NewCoreDNS(etcdCfg.Config,
+					dns.DomainNames(globalDomainNames),
+					dns.DomainIPs(globalDomainIPs),
+					dns.DomainPort(globalMinioPort),
+					dns.CoreDNSPath(etcdCfg.CoreDNSPath),
+				)
+				if err != nil {
+					if globalIsGateway {
+						logger.FatalIf(err, "Unable to initialize DNS config")
+					} else {
+						logger.LogIf(ctx, fmt.Errorf("Unable to initialize DNS config for %s: %w",
+							globalDomainNames, err))
+					}
+				}
+			}
 		}
 	}
 
@@ -341,19 +396,6 @@ func lookupConfigs(s config.Config) {
 	// we assume that users are interested in global bucket support
 	// but not federation.
 	globalBucketFederation = etcdCfg.PathPrefix == "" && etcdCfg.Enabled
-
-	if len(globalDomainNames) != 0 && !globalDomainIPs.IsEmpty() && globalEtcdClient != nil {
-		globalDNSConfig, err = dns.NewCoreDNS(etcdCfg.Config,
-			dns.DomainNames(globalDomainNames),
-			dns.DomainIPs(globalDomainIPs),
-			dns.DomainPort(globalMinioPort),
-			dns.CoreDNSPath(etcdCfg.CoreDNSPath),
-		)
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to initialize DNS config for %s: %w",
-				globalDomainNames, err))
-		}
-	}
 
 	globalServerRegion, err = config.LookupRegion(s[config.RegionSubSys][config.Default])
 	if err != nil {
@@ -365,11 +407,15 @@ func lookupConfigs(s config.Config) {
 		logger.LogIf(ctx, fmt.Errorf("Invalid api configuration: %w", err))
 	}
 
-	globalAPIConfig.init(apiConfig)
+	globalAPIConfig.init(apiConfig, setDriveCount)
+
+	// Initialize remote instance transport once.
+	getRemoteInstanceTransportOnce.Do(func() {
+		getRemoteInstanceTransport = newGatewayHTTPTransport(apiConfig.RemoteTransportDeadline)
+	})
 
 	if globalIsErasure {
-		globalStorageClass, err = storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default],
-			globalErasureSetDriveCount)
+		globalStorageClass, err = storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount)
 		if err != nil {
 			logger.LogIf(ctx, fmt.Errorf("Unable to initialize storage class config: %w", err))
 		}
@@ -377,7 +423,11 @@ func lookupConfigs(s config.Config) {
 
 	globalCacheConfig, err = cache.LookupConfig(s[config.CacheSubSys][config.Default])
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to setup cache: %w", err))
+		if globalIsGateway {
+			logger.FatalIf(err, "Unable to setup cache")
+		} else {
+			logger.LogIf(ctx, fmt.Errorf("Unable to setup cache: %w", err))
+		}
 	}
 
 	if globalCacheConfig.Enabled {
@@ -387,6 +437,10 @@ func lookupConfigs(s config.Config) {
 				logger.LogIf(ctx, fmt.Errorf("Unable to setup encryption cache: %w", err))
 			}
 		}
+	}
+	globalCrawlerConfig, err = crawler.LookupConfig(s[config.CrawlerSubSys][config.Default])
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("Unable to read crawler config: %w", err))
 	}
 
 	kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), NewGatewayHTTPTransport())
@@ -401,6 +455,9 @@ func lookupConfigs(s config.Config) {
 
 	// Enable auto-encryption if enabled
 	globalAutoEncryption = kmsCfg.AutoEncryption
+	if globalAutoEncryption && !globalIsGateway {
+		logger.LogIf(ctx, fmt.Errorf("%s env is deprecated please migrate to using `mc encrypt` at bucket level", crypto.EnvKMSAutoEncryption))
+	}
 
 	globalCompressConfig, err = compress.LookupConfig(s[config.CompressionSubSys][config.Default])
 	if err != nil {
@@ -439,37 +496,41 @@ func lookupConfigs(s config.Config) {
 	for _, l := range loggerCfg.HTTP {
 		if l.Enabled {
 			// Enable http logging
-			logger.AddTarget(
+			if err = logger.AddTarget(
 				http.New(http.WithEndpoint(l.Endpoint),
 					http.WithAuthToken(l.AuthToken),
 					http.WithUserAgent(loggerUserAgent),
 					http.WithLogKind(string(logger.All)),
 					http.WithTransport(NewGatewayHTTPTransport()),
 				),
-			)
+			); err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize console HTTP target: %w", err))
+			}
 		}
 	}
 
 	for _, l := range loggerCfg.Audit {
 		if l.Enabled {
 			// Enable http audit logging
-			logger.AddAuditTarget(
+			if err = logger.AddAuditTarget(
 				http.New(http.WithEndpoint(l.Endpoint),
 					http.WithAuthToken(l.AuthToken),
 					http.WithUserAgent(loggerUserAgent),
 					http.WithLogKind(string(logger.All)),
 					http.WithTransport(NewGatewayHTTPTransport()),
 				),
-			)
+			); err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize audit HTTP target: %w", err))
+			}
 		}
 	}
 
-	globalConfigTargetList, err = notify.GetNotificationTargets(s, GlobalContext.Done(), NewGatewayHTTPTransport())
+	globalConfigTargetList, err = notify.GetNotificationTargets(GlobalContext, s, NewGatewayHTTPTransport(), false)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize notification target(s): %w", err))
 	}
 
-	globalEnvTargetList, err = notify.GetNotificationTargets(newServerConfig(), GlobalContext.Done(), NewGatewayHTTPTransport())
+	globalEnvTargetList, err = notify.GetNotificationTargets(GlobalContext, newServerConfig(), NewGatewayHTTPTransport(), true)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize notification target(s): %w", err))
 	}
@@ -561,9 +622,6 @@ func newSrvConfig(objAPI ObjectLayer) error {
 	// Initialize server config.
 	srvCfg := newServerConfig()
 
-	// Override any values from ENVs.
-	lookupConfigs(srvCfg)
-
 	// hold the mutex lock before a new config is assigned.
 	globalServerConfigMu.Lock()
 	globalServerConfig = srvCfg
@@ -586,7 +644,7 @@ func loadConfig(objAPI ObjectLayer) error {
 	}
 
 	// Override any values from ENVs.
-	lookupConfigs(srvCfg)
+	lookupConfigs(srvCfg, objAPI.SetDriveCount())
 
 	// hold the mutex lock before a new config is assigned.
 	globalServerConfigMu.Lock()

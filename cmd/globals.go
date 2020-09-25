@@ -21,13 +21,12 @@ import (
 	"os"
 	"time"
 
-	"github.com/minio/minio-go/v6/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/set"
 
-	etcd "github.com/coreos/etcd/clientv3"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/minio/cmd/config/cache"
 	"github.com/minio/minio/cmd/config/compress"
-	"github.com/minio/minio/cmd/config/etcd/dns"
+	"github.com/minio/minio/cmd/config/dns"
 	xldap "github.com/minio/minio/cmd/config/identity/ldap"
 	"github.com/minio/minio/cmd/config/identity/openid"
 	"github.com/minio/minio/cmd/config/policy/opa"
@@ -35,6 +34,7 @@ import (
 	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/pkg/auth"
+	etcd "go.etcd.io/etcd/v3/clientv3"
 
 	"github.com/minio/minio/pkg/certs"
 	"github.com/minio/minio/pkg/event"
@@ -58,12 +58,13 @@ const (
 	globalMinioDefaultOwnerID      = "02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4"
 	globalMinioDefaultStorageClass = "STANDARD"
 	globalWindowsOSName            = "windows"
-	globalNetBSDOSName             = "netbsd"
 	globalMacOSName                = "darwin"
 	globalMinioModeFS              = "mode-server-fs"
 	globalMinioModeErasure         = "mode-server-xl"
 	globalMinioModeDistErasure     = "mode-server-distributed-xl"
 	globalMinioModeGatewayPrefix   = "mode-gateway-"
+	globalDirSuffix                = "__XLDIR__"
+	globalDirSuffixWithSlash       = globalDirSuffix + slashSeparator
 
 	// Add new global values here.
 )
@@ -80,10 +81,10 @@ const (
 	// date and server date during signature verification.
 	globalMaxSkewTime = 15 * time.Minute // 15 minutes skew allowed.
 
-	// GlobalMultipartExpiry - Expiry duration after which the multipart uploads are deemed stale.
-	GlobalMultipartExpiry = time.Hour * 24 * 3 // 3 days.
-	// GlobalMultipartCleanupInterval - Cleanup interval when the stale multipart cleanup is initiated.
-	GlobalMultipartCleanupInterval = time.Hour * 24 // 24 hrs.
+	// GlobalStaleUploadsExpiry - Expiry duration after which the uploads in multipart, tmp directory are deemed stale.
+	GlobalStaleUploadsExpiry = time.Hour * 24 // 24 hrs.
+	// GlobalStaleUploadsCleanupInterval - Cleanup interval when the stale uploads cleanup is initiated.
+	GlobalStaleUploadsCleanupInterval = time.Hour * 24 // 24 hrs.
 
 	// GlobalServiceExecutionInterval - Executes the Lifecycle events.
 	GlobalServiceExecutionInterval = time.Hour * 24 // 24 hrs.
@@ -96,6 +97,9 @@ const (
 
 	// Maximum size of default bucket encryption configuration allowed
 	maxBucketSSEConfigSize = 1 * humanize.MiByte
+
+	// diskFillFraction is the fraction of a disk we allow to be filled.
+	diskFillFraction = 0.95
 )
 
 var globalCLIContext = struct {
@@ -106,9 +110,6 @@ var globalCLIContext = struct {
 }{}
 
 var (
-	// Indicates set drive count.
-	globalErasureSetDriveCount int
-
 	// Indicates if the running minio server is distributed setup.
 	globalIsDistErasure = false
 
@@ -153,7 +154,7 @@ var (
 
 	globalLifecycleSys       *LifecycleSys
 	globalBucketSSEConfigSys *BucketSSEConfigSys
-
+	globalBucketTargetSys    *BucketTargetSys
 	// globalAPIConfig controls S3 API requests throttling,
 	// healthcheck readiness deadlines and cors settings.
 	globalAPIConfig apiConfig
@@ -168,7 +169,7 @@ var (
 	// IsSSL indicates if the server is configured with SSL.
 	globalIsSSL bool
 
-	globalTLSCerts *certs.Certs
+	globalTLSCerts *certs.Manager
 
 	globalHTTPServer        *xhttp.Server
 	globalHTTPServerErrorCh = make(chan error)
@@ -209,9 +210,7 @@ var (
 	globalDomainNames []string      // Root domains for virtual host style requests
 	globalDomainIPs   set.StringSet // Root domain IP address(s) for a distributed MinIO deployment
 
-	globalObjectTimeout    = newDynamicTimeout( /*1*/ 10*time.Minute /*10*/, 600*time.Second) // timeout for Object API related ops
-	globalOperationTimeout = newDynamicTimeout(10*time.Minute /*30*/, 600*time.Second)        // default timeout for general ops
-	globalHealingTimeout   = newDynamicTimeout(30*time.Minute /*1*/, 30*time.Minute)          // timeout for healing related ops
+	globalOperationTimeout = newDynamicTimeout(10*time.Minute, 5*time.Minute) // default timeout for general ops
 
 	globalBucketObjectLockSys *BucketObjectLockSys
 	globalBucketQuotaSys      *BucketQuotaSys
@@ -231,7 +230,7 @@ var (
 	globalBucketFederation bool
 
 	// Allocated DNS config wrapper over etcd client.
-	globalDNSConfig *dns.CoreDNS
+	globalDNSConfig dns.Store
 
 	// GlobalKMS initialized KMS configuration
 	GlobalKMS crypto.KMS
@@ -276,6 +275,7 @@ var (
 	// If writes to FS backend should be O_SYNC.
 	globalFSOSync bool
 
+	globalProxyEndpoints []ProxyEndpoint
 	// Add new variable global values here.
 )
 

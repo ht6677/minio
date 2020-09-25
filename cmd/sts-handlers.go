@@ -88,7 +88,7 @@ func registerSTSRouter(router *mux.Router) {
 		ctypeOk := wildcard.MatchSimple("application/x-www-form-urlencoded*", r.Header.Get(xhttp.ContentType))
 		noQueries := len(r.URL.Query()) == 0
 		return ctypeOk && noQueries
-	}).HandlerFunc(httpTraceAll(sts.AssumeRoleWithJWT))
+	}).HandlerFunc(httpTraceAll(sts.AssumeRoleWithSSO))
 
 	// AssumeRoleWithClientGrants
 	stsRouter.Methods(http.MethodPost).HandlerFunc(httpTraceAll(sts.AssumeRoleWithClientGrants)).
@@ -258,8 +258,8 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 	writeSuccessResponseXML(w, encodeResponse(assumeRoleResponse))
 }
 
-func (sts *stsAPIHandlers) AssumeRoleWithJWT(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "AssumeRoleJWTCommon")
+func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "AssumeRoleSSOCommon")
 
 	// Parse the incoming form data.
 	if err := r.ParseForm(); err != nil {
@@ -274,6 +274,9 @@ func (sts *stsAPIHandlers) AssumeRoleWithJWT(w http.ResponseWriter, r *http.Requ
 
 	action := r.Form.Get(stsAction)
 	switch action {
+	case ldapIdentity:
+		sts.AssumeRoleWithLDAPIdentity(w, r)
+		return
 	case clientGrants, webIdentity:
 	default:
 		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Unsupported action %s", action))
@@ -318,6 +321,22 @@ func (sts *stsAPIHandlers) AssumeRoleWithJWT(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// JWT has requested a custom claim with policy value set.
+	// This is a MinIO STS API specific value, this value should
+	// be set and configured on your identity provider as part of
+	// JWT custom claims.
+	var policyName string
+	policySet, ok := iampolicy.GetPoliciesFromClaims(m, iamPolicyClaimNameOpenID())
+	if ok {
+		policyName = globalIAMSys.currentPolicies(strings.Join(policySet.ToSlice(), ","))
+	}
+
+	if policyName == "" && globalPolicyOPA == nil {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("%s claim missing from the JWT token, credentials will not be generated", iamPolicyClaimNameOpenID()))
+		return
+	}
+	m[iamPolicyClaimNameOpenID()] = policyName
+
 	sessionPolicyStr := r.Form.Get(stsPolicy)
 	// https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html
 	// The plain text that you use for both inline and managed session
@@ -339,9 +358,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithJWT(w http.ResponseWriter, r *http.Requ
 			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Invalid session policy version"))
 			return
 		}
-	}
 
-	if len(sessionPolicyStr) > 0 {
 		m[iampolicy.SessionPolicyName] = base64.StdEncoding.EncodeToString([]byte(sessionPolicyStr))
 	}
 
@@ -350,15 +367,6 @@ func (sts *stsAPIHandlers) AssumeRoleWithJWT(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
 		return
-	}
-
-	// JWT has requested a custom claim with policy value set.
-	// This is a MinIO STS API specific value, this value should
-	// be set and configured on your identity provider as part of
-	// JWT custom claims.
-	var policyName string
-	if v, ok := m[iamPolicyClaimNameOpenID()]; ok {
-		policyName, _ = v.(string)
 	}
 
 	var subFromToken string
@@ -412,7 +420,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithJWT(w http.ResponseWriter, r *http.Requ
 // Eg:-
 //    $ curl https://minio:9000/?Action=AssumeRoleWithWebIdentity&WebIdentityToken=<jwt>
 func (sts *stsAPIHandlers) AssumeRoleWithWebIdentity(w http.ResponseWriter, r *http.Request) {
-	sts.AssumeRoleWithJWT(w, r)
+	sts.AssumeRoleWithSSO(w, r)
 }
 
 // AssumeRoleWithClientGrants - implementation of AWS STS extension API supporting
@@ -421,7 +429,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithWebIdentity(w http.ResponseWriter, r *h
 // Eg:-
 //    $ curl https://minio:9000/?Action=AssumeRoleWithClientGrants&Token=<jwt>
 func (sts *stsAPIHandlers) AssumeRoleWithClientGrants(w http.ResponseWriter, r *http.Request) {
-	sts.AssumeRoleWithJWT(w, r)
+	sts.AssumeRoleWithSSO(w, r)
 }
 
 // AssumeRoleWithLDAPIdentity - implements user auth against LDAP server

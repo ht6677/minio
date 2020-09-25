@@ -36,15 +36,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/s2"
 	"github.com/klauspost/readahead"
-	"github.com/minio/minio-go/v6/pkg/s3utils"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio/cmd/config/compress"
-	"github.com/minio/minio/cmd/config/etcd/dns"
+	"github.com/minio/minio/cmd/config/dns"
 	"github.com/minio/minio/cmd/config/storageclass"
 	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/hash"
 	"github.com/minio/minio/pkg/ioutil"
+	"github.com/minio/minio/pkg/trie"
 	"github.com/minio/minio/pkg/wildcard"
 )
 
@@ -270,7 +271,7 @@ func removeStandardStorageClass(metadata map[string]string) map[string]string {
 // cleanMetadataKeys takes keyNames to be filtered
 // and returns a new map with all the entries with keyNames removed.
 func cleanMetadataKeys(metadata map[string]string, keyNames ...string) map[string]string {
-	var newMeta = make(map[string]string)
+	var newMeta = make(map[string]string, len(metadata))
 	for k, v := range metadata {
 		if contains(keyNames, k) {
 			continue
@@ -346,18 +347,34 @@ func isMinioReservedBucket(bucketName string) bool {
 
 // returns a slice of hosts by reading a slice of DNS records
 func getHostsSlice(records []dns.SrvRecord) []string {
-	var hosts []string
-	for _, r := range records {
-		hosts = append(hosts, net.JoinHostPort(r.Host, string(r.Port)))
+	hosts := make([]string, len(records))
+	for i, r := range records {
+		hosts[i] = net.JoinHostPort(r.Host, string(r.Port))
 	}
 	return hosts
 }
 
-// returns a host (and corresponding port) from a slice of DNS records
-func getHostFromSrv(records []dns.SrvRecord) string {
-	rand.Seed(time.Now().Unix())
-	srvRecord := records[rand.Intn(len(records))]
-	return net.JoinHostPort(srvRecord.Host, string(srvRecord.Port))
+// returns an online host (and corresponding port) from a slice of DNS records
+func getHostFromSrv(records []dns.SrvRecord) (host string) {
+	hosts := getHostsSlice(records)
+	rng := rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
+	var d net.Dialer
+	var retry int
+	for retry < len(hosts) {
+		ctx, cancel := context.WithTimeout(GlobalContext, 300*time.Millisecond)
+
+		host = hosts[rng.Intn(len(hosts))]
+		conn, err := d.DialContext(ctx, "tcp", host)
+		cancel()
+		if err != nil {
+			retry++
+			continue
+		}
+		conn.Close()
+		break
+	}
+
+	return host
 }
 
 // IsCompressed returns true if the object is marked as compressed.
@@ -380,6 +397,15 @@ func (o ObjectInfo) IsCompressedOK() (bool, error) {
 		return true, nil
 	}
 	return true, fmt.Errorf("unknown compression scheme: %s", scheme)
+}
+
+// GetActualETag - returns the actual etag of the stored object
+// decrypts SSE objects.
+func (o ObjectInfo) GetActualETag(h http.Header) string {
+	if !crypto.IsEncrypted(o.UserDefined) {
+		return o.ETag
+	}
+	return getDecryptedETag(h, o, false)
 }
 
 // GetActualSize - returns the actual size of the stored object
@@ -460,13 +486,12 @@ func hasPattern(patterns []string, matchStr string) bool {
 }
 
 // Returns the part file name which matches the partNumber and etag.
-func getPartFile(entries []string, partNumber int, etag string) string {
-	for _, entry := range entries {
-		if strings.HasPrefix(entry, fmt.Sprintf("%.5d.%s.", partNumber, etag)) {
-			return entry
-		}
+func getPartFile(entriesTrie *trie.Trie, partNumber int, etag string) (partFile string) {
+	for _, match := range entriesTrie.PrefixMatch(fmt.Sprintf("%.5d.%s.", partNumber, etag)) {
+		partFile = match
+		break
 	}
-	return ""
+	return partFile
 }
 
 // Returns the compressed offset which should be skipped.
@@ -509,14 +534,12 @@ type GetObjectReader struct {
 // NewGetObjectReaderFromReader sets up a GetObjectReader with a given
 // reader. This ignores any object properties.
 func NewGetObjectReaderFromReader(r io.Reader, oi ObjectInfo, opts ObjectOptions, cleanupFns ...func()) (*GetObjectReader, error) {
-	if opts.CheckCopyPrecondFn != nil {
-		if ok := opts.CheckCopyPrecondFn(oi, ""); ok {
-			// Call the cleanup funcs
-			for i := len(cleanupFns) - 1; i >= 0; i-- {
-				cleanupFns[i]()
-			}
-			return nil, PreConditionFailed{}
+	if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
+		// Call the cleanup funcs
+		for i := len(cleanupFns) - 1; i >= 0; i-- {
+			cleanupFns[i]()
 		}
+		return nil, PreConditionFailed{}
 	}
 	return &GetObjectReader{
 		ObjInfo:    oi,
@@ -530,7 +553,7 @@ func NewGetObjectReaderFromReader(r io.Reader, oi ObjectInfo, opts ObjectOptions
 // GetObjectReader and an error. Request headers are passed to provide
 // encryption parameters. cleanupFns allow cleanup funcs to be
 // registered for calling after usage of the reader.
-type ObjReaderFn func(inputReader io.Reader, h http.Header, pcfn CheckCopyPreconditionFn, cleanupFns ...func()) (r *GetObjectReader, err error)
+type ObjReaderFn func(inputReader io.Reader, h http.Header, pcfn CheckPreconditionFn, cleanupFns ...func()) (r *GetObjectReader, err error)
 
 // NewGetObjectReader creates a new GetObjectReader. The cleanUpFns
 // are called on Close() in reverse order as passed here. NOTE: It is
@@ -581,7 +604,7 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, cl
 		// a reader that returns the desired range of
 		// encrypted bytes. The header parameter is used to
 		// provide encryption parameters.
-		fn = func(inputReader io.Reader, h http.Header, pcfn CheckCopyPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
+		fn = func(inputReader io.Reader, h http.Header, pcfn CheckPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
 			copySource := h.Get(crypto.SSECopyAlgorithm) != ""
 
 			cFns = append(cleanUpFns, cFns...)
@@ -596,18 +619,16 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, cl
 				}
 				return nil, err
 			}
-			encETag := oi.ETag
-			oi.ETag = getDecryptedETag(h, oi, copySource) // Decrypt the ETag before top layer consumes this value.
 
-			if opts.CheckCopyPrecondFn != nil {
-				if ok := opts.CheckCopyPrecondFn(oi, encETag); ok {
-					// Call the cleanup funcs
-					for i := len(cFns) - 1; i >= 0; i-- {
-						cFns[i]()
-					}
-					return nil, PreConditionFailed{}
+			if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
+				// Call the cleanup funcs
+				for i := len(cFns) - 1; i >= 0; i-- {
+					cFns[i]()
 				}
+				return nil, PreConditionFailed{}
 			}
+
+			oi.ETag = getDecryptedETag(h, oi, false)
 
 			// Apply the skipLen and limit on the
 			// decrypted stream
@@ -650,16 +671,14 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, cl
 				return nil, 0, 0, errInvalidRange
 			}
 		}
-		fn = func(inputReader io.Reader, _ http.Header, pcfn CheckCopyPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
+		fn = func(inputReader io.Reader, _ http.Header, pcfn CheckPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
 			cFns = append(cleanUpFns, cFns...)
-			if opts.CheckCopyPrecondFn != nil {
-				if ok := opts.CheckCopyPrecondFn(oi, ""); ok {
-					// Call the cleanup funcs
-					for i := len(cFns) - 1; i >= 0; i-- {
-						cFns[i]()
-					}
-					return nil, PreConditionFailed{}
+			if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
+				// Call the cleanup funcs
+				for i := len(cFns) - 1; i >= 0; i-- {
+					cFns[i]()
 				}
+				return nil, PreConditionFailed{}
 			}
 			// Decompression reader.
 			s2Reader := s2.NewReader(inputReader)
@@ -700,16 +719,14 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, cl
 		if err != nil {
 			return nil, 0, 0, err
 		}
-		fn = func(inputReader io.Reader, _ http.Header, pcfn CheckCopyPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
+		fn = func(inputReader io.Reader, _ http.Header, pcfn CheckPreconditionFn, cFns ...func()) (r *GetObjectReader, err error) {
 			cFns = append(cleanUpFns, cFns...)
-			if opts.CheckCopyPrecondFn != nil {
-				if ok := opts.CheckCopyPrecondFn(oi, ""); ok {
-					// Call the cleanup funcs
-					for i := len(cFns) - 1; i >= 0; i-- {
-						cFns[i]()
-					}
-					return nil, PreConditionFailed{}
+			if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
+				// Call the cleanup funcs
+				for i := len(cFns) - 1; i >= 0; i-- {
+					cFns[i]()
 				}
+				return nil, PreConditionFailed{}
 			}
 			r = &GetObjectReader{
 				ObjInfo:    oi,
@@ -857,20 +874,4 @@ func newS2CompressReader(r io.Reader) io.ReadCloser {
 		pw.Close()
 	}()
 	return pr
-}
-
-// Returns error if the context is canceled, indicating
-// either client has disconnected
-type contextReader struct {
-	io.ReadCloser
-	ctx context.Context
-}
-
-func (d *contextReader) Read(p []byte) (int, error) {
-	select {
-	case <-d.ctx.Done():
-		return 0, d.ctx.Err()
-	default:
-		return d.ReadCloser.Read(p)
-	}
 }

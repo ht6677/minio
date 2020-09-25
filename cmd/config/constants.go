@@ -31,11 +31,13 @@ const (
 	EnvDomain       = "MINIO_DOMAIN"
 	EnvRegionName   = "MINIO_REGION_NAME"
 	EnvPublicIPs    = "MINIO_PUBLIC_IPS"
-	EnvEndpoints    = "MINIO_ENDPOINTS"
 	EnvFSOSync      = "MINIO_FS_OSYNC"
+	EnvArgs         = "MINIO_ARGS"
+	EnvDNSWebhook   = "MINIO_DNS_WEBHOOK_ENDPOINT"
 
 	EnvUpdate = "MINIO_UPDATE"
 
-	EnvWorm   = "MINIO_WORM"   // legacy
-	EnvRegion = "MINIO_REGION" // legacy
+	EnvEndpoints = "MINIO_ENDPOINTS" // legacy
+	EnvWorm      = "MINIO_WORM"      // legacy
+	EnvRegion    = "MINIO_REGION"    // legacy
 )

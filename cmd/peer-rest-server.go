@@ -47,7 +47,7 @@ func (s *peerRESTServer) GetLocksHandler(w http.ResponseWriter, r *http.Request)
 
 	ctx := newContext(r, w, "GetLocks")
 
-	var llockers []map[string][]lockRequesterInfo
+	llockers := make([]map[string][]lockRequesterInfo, 0, len(globalLockServers))
 	for _, llocker := range globalLockServers {
 		llockers = append(llockers, llocker.DupLockMap())
 	}
@@ -182,7 +182,7 @@ func (s *peerRESTServer) DeleteServiceAccountHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	if err := globalIAMSys.DeleteServiceAccount(context.Background(), accessKey); err != nil {
+	if err := globalIAMSys.DeleteServiceAccount(r.Context(), accessKey); err != nil {
 		s.writeErrorResponse(w, err)
 		return
 	}
@@ -545,6 +545,22 @@ func (s *peerRESTServer) ProcOBDInfoHandler(w http.ResponseWriter, r *http.Reque
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
 }
 
+// LogOBDInfoHandler - returns Log OBD info.
+func (s *peerRESTServer) LogOBDInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		s.writeErrorResponse(w, errors.New("Invalid request"))
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	info := getLocalLogOBD(ctx, r)
+
+	defer w.(http.Flusher).Flush()
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
+}
+
 // MemOBDInfoHandler - returns Mem OBD info.
 func (s *peerRESTServer) MemOBDInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
@@ -606,6 +622,14 @@ func (s *peerRESTServer) LoadBucketMetadataHandler(w http.ResponseWriter, r *htt
 	}
 
 	globalBucketMetadataSys.Set(bucketName, meta)
+
+	if meta.notificationConfig != nil {
+		globalNotificationSys.AddRulesMap(bucketName, meta.notificationConfig.ToRulesMap())
+	}
+
+	if meta.bucketTargetConfig != nil {
+		globalBucketTargetSys.UpdateTarget(bucketName, meta.bucketTargetConfig)
+	}
 }
 
 // ReloadFormatHandler - Reload Format.
@@ -729,6 +753,11 @@ func getLocalDiskIDs(z *erasureZones) []string {
 	return ids
 }
 
+// HealthHandler - returns true of health
+func (s *peerRESTServer) HealthHandler(w http.ResponseWriter, r *http.Request) {
+	s.IsValid(w, r)
+}
+
 // GetLocalDiskIDs - Return disk IDs of all the local disks.
 func (s *peerRESTServer) GetLocalDiskIDs(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
@@ -764,25 +793,21 @@ func (s *peerRESTServer) ServerUpdateHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	vars := mux.Vars(r)
-	updateURL := vars[peerRESTUpdateURL]
-	sha256Hex := vars[peerRESTSha256Hex]
-	var latestReleaseTime time.Time
-	var err error
-	if latestRelease := vars[peerRESTLatestRelease]; latestRelease != "" {
-		latestReleaseTime, err = time.Parse(time.RFC3339, latestRelease)
-		if err != nil {
-			s.writeErrorResponse(w, err)
-			return
-		}
+	if r.ContentLength < 0 {
+		s.writeErrorResponse(w, errInvalidArgument)
+		return
 	}
-	us, err := updateServer(updateURL, sha256Hex, latestReleaseTime)
+
+	var info serverUpdateInfo
+	err := gob.NewDecoder(r.Body).Decode(&info)
 	if err != nil {
 		s.writeErrorResponse(w, err)
 		return
 	}
-	if us.CurrentVersion != us.UpdatedVersion {
-		globalServiceSignalCh <- serviceRestart
+
+	if _, err = updateServer(info.URL, info.Sha256Sum, info.Time, getMinioMode()); err != nil {
+		s.writeErrorResponse(w, err)
+		return
 	}
 }
 
@@ -888,8 +913,10 @@ func (s *peerRESTServer) ListenHandler(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return false
 		}
-		if ev.S3.Bucket.Name != values.Get(peerRESTListenBucket) {
-			return false
+		if ev.S3.Bucket.Name != "" && values.Get(peerRESTListenBucket) != "" {
+			if ev.S3.Bucket.Name != values.Get(peerRESTListenBucket) {
+				return false
+			}
 		}
 		return rulesMap.MatchSimple(ev.EventName, ev.S3.Object.Key)
 	})
@@ -965,7 +992,11 @@ func (s *peerRESTServer) BackgroundHealStatusHandler(w http.ResponseWriter, r *h
 
 	ctx := newContext(r, w, "BackgroundHealStatus")
 
-	state := getLocalBackgroundHealStatus()
+	state, ok := getLocalBackgroundHealStatus()
+	if !ok {
+		s.writeErrorResponse(w, errServerNotInitialized)
+		return
+	}
 
 	defer w.(http.Flusher).Flush()
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(state))
@@ -1020,9 +1051,11 @@ func (s *peerRESTServer) IsValid(w http.ResponseWriter, r *http.Request) bool {
 func registerPeerRESTHandlers(router *mux.Router) {
 	server := &peerRESTServer{}
 	subrouter := router.PathPrefix(peerRESTPrefix).Subrouter()
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodHealth).HandlerFunc(httpTraceHdrs(server.HealthHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetLocks).HandlerFunc(httpTraceHdrs(server.GetLocksHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodServerInfo).HandlerFunc(httpTraceHdrs(server.ServerInfoHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodProcOBDInfo).HandlerFunc(httpTraceHdrs(server.ProcOBDInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLogOBDInfo).HandlerFunc(httpTraceHdrs(server.LogOBDInfoHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodMemOBDInfo).HandlerFunc(httpTraceHdrs(server.MemOBDInfoHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodOsInfoOBDInfo).HandlerFunc(httpTraceHdrs(server.OsOBDInfoHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDiskHwOBDInfo).HandlerFunc(httpTraceHdrs(server.DiskHwOBDInfoHandler))
@@ -1034,8 +1067,7 @@ func registerPeerRESTHandlers(router *mux.Router) {
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeleteBucketMetadata).HandlerFunc(httpTraceHdrs(server.DeleteBucketMetadataHandler)).Queries(restQueries(peerRESTBucket)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadBucketMetadata).HandlerFunc(httpTraceHdrs(server.LoadBucketMetadataHandler)).Queries(restQueries(peerRESTBucket)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodSignalService).HandlerFunc(httpTraceHdrs(server.SignalServiceHandler)).Queries(restQueries(peerRESTSignal)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodServerUpdate).HandlerFunc(httpTraceHdrs(server.ServerUpdateHandler)).Queries(restQueries(peerRESTUpdateURL, peerRESTSha256Hex, peerRESTLatestRelease)...)
-
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodServerUpdate).HandlerFunc(httpTraceHdrs(server.ServerUpdateHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeletePolicy).HandlerFunc(httpTraceAll(server.DeletePolicyHandler)).Queries(restQueries(peerRESTPolicy)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadPolicy).HandlerFunc(httpTraceAll(server.LoadPolicyHandler)).Queries(restQueries(peerRESTPolicy)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadPolicyMapping).HandlerFunc(httpTraceAll(server.LoadPolicyMappingHandler)).Queries(restQueries(peerRESTUserOrGroup)...)

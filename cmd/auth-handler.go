@@ -213,15 +213,15 @@ func getClaimsFromToken(r *http.Request, token string) (map[string]interface{}, 
 
 	if globalPolicyOPA == nil {
 		// If OPA is not set and if ldap claim key is set, allow the claim.
-		if _, ok := claims.Lookup(ldapUser); ok {
+		if _, ok := claims.MapClaims[ldapUser]; ok {
 			return claims.Map(), nil
 		}
 
 		// If OPA is not set, session token should
 		// have a policy and its mandatory, reject
 		// requests without policy claim.
-		_, pokOpenID := claims.Lookup(iamPolicyClaimNameOpenID())
-		_, pokSA := claims.Lookup(iamPolicyClaimNameSA())
+		_, pokOpenID := claims.MapClaims[iamPolicyClaimNameOpenID()]
+		_, pokSA := claims.MapClaims[iamPolicyClaimNameSA()]
 		if !pokOpenID && !pokSA {
 			return nil, errAuthentication
 		}
@@ -346,8 +346,26 @@ func checkRequestAuthTypeToAccessKey(ctx context.Context, r *http.Request, actio
 			// Request is allowed return the appropriate access key.
 			return cred.AccessKey, owner, ErrNone
 		}
+
+		if action == policy.ListBucketVersionsAction {
+			// In AWS S3 s3:ListBucket permission is same as s3:ListBucketVersions permission
+			// verify as a fallback.
+			if globalPolicySys.IsAllowed(policy.Args{
+				AccountName:     cred.AccessKey,
+				Action:          policy.ListBucketAction,
+				BucketName:      bucketName,
+				ConditionValues: getConditionValues(r, locationConstraint, "", nil),
+				IsOwner:         false,
+				ObjectName:      objectName,
+			}) {
+				// Request is allowed return the appropriate access key.
+				return cred.AccessKey, owner, ErrNone
+			}
+		}
+
 		return cred.AccessKey, owner, ErrAccessDenied
 	}
+
 	if globalIAMSys.IsAllowed(iampolicy.Args{
 		AccountName:     cred.AccessKey,
 		Action:          iampolicy.Action(action),
@@ -360,6 +378,23 @@ func checkRequestAuthTypeToAccessKey(ctx context.Context, r *http.Request, actio
 		// Request is allowed return the appropriate access key.
 		return cred.AccessKey, owner, ErrNone
 	}
+	if action == policy.ListBucketVersionsAction {
+		// In AWS S3 s3:ListBucket permission is same as s3:ListBucketVersions permission
+		// verify as a fallback.
+		if globalIAMSys.IsAllowed(iampolicy.Args{
+			AccountName:     cred.AccessKey,
+			Action:          iampolicy.Action(policy.ListBucketAction),
+			BucketName:      bucketName,
+			ConditionValues: getConditionValues(r, "", cred.AccessKey, claims),
+			ObjectName:      objectName,
+			IsOwner:         owner,
+			Claims:          claims,
+		}) {
+			// Request is allowed return the appropriate access key.
+			return cred.AccessKey, owner, ErrNone
+		}
+	}
+
 	return cred.AccessKey, owner, ErrAccessDenied
 }
 

@@ -26,6 +26,7 @@ import (
 
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/bucket/replication"
 	"github.com/minio/minio/pkg/sync/errgroup"
 	"github.com/minio/sha256-simd"
 )
@@ -87,29 +88,30 @@ func (fi FileInfo) IsValid() bool {
 		// for erasure coding information
 		return true
 	}
-	data := fi.Erasure.DataBlocks
-	parity := fi.Erasure.ParityBlocks
-	return ((data >= parity) && (data != 0) && (parity != 0))
+	dataBlocks := fi.Erasure.DataBlocks
+	parityBlocks := fi.Erasure.ParityBlocks
+	return ((dataBlocks >= parityBlocks) &&
+		(dataBlocks != 0) && (parityBlocks != 0))
 }
 
 // ToObjectInfo - Converts metadata to object info.
 func (fi FileInfo) ToObjectInfo(bucket, object string) ObjectInfo {
-	if HasSuffix(object, SlashSeparator) {
-		return ObjectInfo{
-			Bucket: bucket,
-			Name:   object,
-			IsDir:  true,
-		}
+	object = decodeDirObject(object)
+	versionID := fi.VersionID
+	if globalBucketVersioningSys.Enabled(bucket) && versionID == "" {
+		versionID = nullVersionID
 	}
+
 	objInfo := ObjectInfo{
-		IsDir:           false,
+		IsDir:           HasSuffix(object, SlashSeparator),
 		Bucket:          bucket,
 		Name:            object,
-		VersionID:       fi.VersionID,
+		VersionID:       versionID,
 		IsLatest:        fi.IsLatest,
 		DeleteMarker:    fi.Deleted,
 		Size:            fi.Size,
 		ModTime:         fi.ModTime,
+		Legacy:          fi.XLV1,
 		ContentType:     fi.Metadata["content-type"],
 		ContentEncoding: fi.Metadata["content-encoding"],
 	}
@@ -131,6 +133,9 @@ func (fi FileInfo) ToObjectInfo(bucket, object string) ObjectInfo {
 	// Add user tags to the object info
 	objInfo.UserTags = fi.Metadata[xhttp.AmzObjectTagging]
 
+	// Add replication status to the object info
+	objInfo.ReplicationStatus = replication.StatusType(fi.Metadata[xhttp.AmzBucketReplicationStatus])
+
 	// etag/md5Sum has already been extracted. We need to
 	// remove to avoid it from appearing as part of
 	// response headers. e.g, X-Minio-* or X-Amz-*.
@@ -146,7 +151,6 @@ func (fi FileInfo) ToObjectInfo(bucket, object string) ObjectInfo {
 	} else {
 		objInfo.StorageClass = globalMinioDefaultStorageClass
 	}
-
 	// Success.
 	return objInfo
 }
@@ -268,7 +272,7 @@ func renameFileInfo(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry
 			if disks[index] == nil {
 				return errDiskNotFound
 			}
-			if err := disks[index].RenameData(srcBucket, srcEntry, "", dstBucket, dstEntry); err != nil {
+			if err := disks[index].RenameData(ctx, srcBucket, srcEntry, "", dstBucket, dstEntry); err != nil {
 				if !IsErrIgnored(err, ignoredErr...) {
 					return err
 				}
@@ -299,7 +303,7 @@ func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, bucket, prefix
 			}
 			// Pick one FileInfo for a disk at index.
 			files[index].Erasure.Index = index + 1
-			return disks[index].WriteMetadata(bucket, prefix, files[index])
+			return disks[index].WriteMetadata(ctx, bucket, prefix, files[index])
 		}, index)
 	}
 
@@ -320,7 +324,18 @@ func objectQuorumFromMeta(ctx context.Context, er erasureObjects, partsMetaData 
 		return 0, 0, err
 	}
 
+	dataBlocks := latestFileInfo.Erasure.DataBlocks
+	parityBlocks := globalStorageClass.GetParityForSC(latestFileInfo.Metadata[xhttp.AmzStorageClass])
+	if parityBlocks == 0 {
+		parityBlocks = dataBlocks
+	}
+
+	writeQuorum := dataBlocks
+	if dataBlocks == parityBlocks {
+		writeQuorum = dataBlocks + 1
+	}
+
 	// Since all the valid erasure code meta updated at the same time are equivalent, pass dataBlocks
 	// from latestFileInfo to get the quorum
-	return latestFileInfo.Erasure.DataBlocks, latestFileInfo.Erasure.DataBlocks + 1, nil
+	return dataBlocks, writeQuorum, nil
 }
